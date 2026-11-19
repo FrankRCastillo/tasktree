@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tasktree"
+version = "0.1.0"
+description = "A strictly local, contract-first recursive reasoning harness for LLMs."
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+    "pydantic>=2.0",
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+tasktree = "tasktree.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

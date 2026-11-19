@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""
+tasktree: A strictly local, contract-first recursive reasoning harness for LLMs.
+"""
+
+import argparse
+import ast
+import configparser
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
+
+
+# ---------------------------------------------------------------------------
+# Structured Output Schemas (reasoning first so Qwen can think before acting)
+# ---------------------------------------------------------------------------
+
+class SubtaskSpec(BaseModel):
+    reasoning: str = Field(description="Why this subtask is needed and how it fits the parent.")
+    title: str = Field(description="Short, clear name for the subtask.")
+    description: str = Field(description="Detailed instructions for what this subtask must produce.")
+    test_criteria: str = Field(description="Concrete pass/fail criteria aligned with the parent's test.")
+    depends_on_indices: List[int] = Field(
+        default_factory=list,
+        description="0-based indices of sibling subtasks in this same list that must finish before this one."
+    )
+    read_files: List[str] = Field(
+        default_factory=list,
+        description="Relative file paths to read from the read-only context directory (if analyzing an existing codebase or docs)."
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Relative path in the workspace to write an artifact/script/code file if needed."
+    )
+    verify_command: Optional[str] = Field(
+        default=None,
+        description="Optional shell command to verify this node deterministically (e.g. 'bash -n script.sh', 'pytest test_x.py', 'python -m py_compile app.py'). Leave null for prose or analysis."
+    )
+
+class PlanResponse(BaseModel):
+    reasoning: str = Field(description="Evaluate whether this task fits in a single small context window or needs splitting.")
+    is_leaf: bool = Field(description="True if this task is small enough to execute directly; False if it must be split.")
+    subtasks: List[SubtaskSpec] = Field(default_factory=list, description="Ordered list of child subtasks if is_leaf is False.")
+
+class ExecutionResponse(BaseModel):
+    reasoning: str = Field(description="Step-by-step reasoning to solve the task.")
+    output: str = Field(description="The final prose, analysis, script, or source code for this node.")
+    summary: str = Field(description="Tight, 2-4 sentence summary of what was built or concluded, for the parent.")
+    assumptions: List[str] = Field(
+        default_factory=list,
+        description="Short list of key assumptions or caveats made so the parent can check for conflicts."
+    )
+
+class JudgeResponse(BaseModel):
+    reasoning: str = Field(description="Strict evaluation of the output against the test criteria.")
+    passed: bool = Field(description="True only if all test criteria are satisfied.")
+    feedback: str = Field(description="Specific, actionable feedback if passed is False.")
+
+
+# ---------------------------------------------------------------------------
+# In-Memory Task Tree Node
+# ---------------------------------------------------------------------------
+@dataclass
+class TaskNode:
+    id: str
+    title: str
+    description: str
+    test_criteria: str
+    parent_id: Optional[str] = None
+    depth: int = 0
+    scope_weight: float = 100.0
+    status: str = "PENDING"
+    depends_on: List[str] = field(default_factory=list)
+    children_ids: List[str] = field(default_factory=list)
+    read_files: List[str] = field(default_factory=list)
+    file_path: Optional[str] = None
+    verify_command: Optional[str] = None
+    output: str = ""
+    summary: str = ""
+    assumptions: List[str] = field(default_factory=list)
+    last_feedback: str = ""
+    retries: int = 0
+    live_tokens: int = 0
+
+# ---------------------------------------------------------------------------
+# Helper Utilities (AST Stubbing, Git Checkpoints, JSON Parsing)
+# ---------------------------------------------------------------------------
+
+def extract_python_stub(file_path: Path) -> str:
+    """Strips a Python file down to imports, class/function signatures, and docstrings."""
+    if not file_path.exists():
+        return ""
+    source = file_path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source[:1500]
+
+    lines: List[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            lines.append(ast.unparse(node))
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(ast.unparse(b) for b in node.bases)
+            lines.append(f"\nclass {node.name}({bases}):" if bases else f"\nclass {node.name}:")
+            doc = ast.get_docstring(node)
+            if doc:
+                lines.append(f'    """{doc}"""')
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    args = ast.unparse(item.args)
+                    ret = f" -> {ast.unparse(item.returns)}" if item.returns else ""
+                    prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
+                    lines.append(f"    {prefix} {item.name}({args}){ret}: ...")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = ast.unparse(node.args)
+            ret = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            lines.append(f"\n{prefix} {node.name}({args}){ret}: ...")
+            doc = ast.get_docstring(node)
+            if doc:
+                lines.append(f'    """{doc}"""')
+    return "\n".join(lines).strip()
+
+def get_directory_tree(root: Path, max_files: int = 150) -> str:
+    """Returns a compact list of relative file paths, skipping noise like .git and node_modules."""
+    ignore = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache"}
+    paths: List[str] = []
+    for path in sorted(root.rglob("*")):
+        if any(part in ignore for part in path.parts):
+            continue
+        if path.is_file():
+            paths.append(str(path.relative_to(root)))
+            if len(paths) >= max_files:
+                paths.append("... (truncated)")
+                break
+    return "\n".join(paths) if paths else "(empty directory)"
+
+
+def read_context_files(context_dir: Optional[Path], rel_paths: List[str], max_chars_per_file: int = 8000) -> str:
+    if not context_dir or not rel_paths:
+        return "None."
+    blocks = []
+    for rel in rel_paths:
+        target = (context_dir / rel).resolve()
+        if not str(target).startswith(str(context_dir.resolve())) or not target.is_file():
+            continue
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+            if len(text) > max_chars_per_file:
+                text = text[:max_chars_per_file] + "\n... [truncated]"
+            blocks.append(f"--- File: {rel} ---\n{text}")
+        except Exception as e:
+            blocks.append(f"--- File: {rel} (unreadable: {e}) ---")
+    return "\n\n".join(blocks) if blocks else "None."
+
+def init_git_workspace(workspace: Path) -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    if not (workspace / ".git").exists():
+        subprocess.run(["git", "init"], cwd=workspace, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "tasktree"], cwd=workspace, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "tasktree@local"], cwd=workspace, capture_output=True)
+
+
+def git_commit(workspace: Path, message: str) -> None:
+    subprocess.run(["git", "add", "."], cwd=workspace, capture_output=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=workspace, capture_output=True)
+
+
+def extract_json_payload(raw_text: str) -> Dict[str, Any]:
+    """Safely extracts JSON even if a local model wraps it in markdown fences."""
+    cleaned = raw_text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1)
+    else:
+        brace_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+        if brace_match:
+            cleaned = brace_match.group(1)
+    return json.loads(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Core Harness
+# ---------------------------------------------------------------------------
+
+class TaskTreeHarness:
+    def __init__(self, config: Dict[str, Any], root_prompt: str, output_file: Optional[str] = None, context_dir: Optional[str] = None):
+        self.config = config
+        self.root_prompt = root_prompt
+        self.workspace = Path(config["workspace"]).resolve()
+        self.output_file = output_file
+        self.checkpoint_path = self.workspace / ".tasktree_state.json"
+
+        self.client = OpenAI(
+            base_url=config["base_url"],
+            api_key=config["api_key"],
+        )
+        self.nodes: Dict[str, TaskNode] = {}
+        self.root_id = "1"
+        self.nodes[self.root_id] = TaskNode(
+            id=self.root_id,
+            title=root_prompt,
+            description=root_prompt,
+            test_criteria=f"Fully and accurately satisfies the user's root request: {root_prompt}",
+            depth=0,
+            scope_weight=100.0,
+        )
+        self.context_dir = Path(context_dir).resolve() if context_dir else None
+
+        init_git_workspace(self.workspace)
+
+    def save_checkpoint(self) -> None:
+        data = {nid: asdict(node) for nid, node in self.nodes.items()}
+        self.checkpoint_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def call_model(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[BaseModel],
+        temp: Optional[float] = None,
+        node: Optional[TaskNode] = None,
+        live: Optional[Live] = None,
+    ) -> BaseModel:
+        """Stateless single-turn call with streaming token counter and schema validation."""
+        schema_json = json.dumps(schema.model_json_schema(), indent=2)
+        full_system = (
+            f"{system_prompt}\n\n"
+            f"You MUST respond with valid JSON strictly matching this schema:\n{schema_json}"
+        )
+        temperature = self.config["temperature"] if temp is None else temp
+
+        last_err = None
+        for _ in range(3):
+            if node is not None:
+                node.live_tokens = 0
+
+            stream = self.client.chat.completions.create(
+                model=self.config["model"],
+                messages=[
+                    {"role": "system", "content": full_system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=self.config["max_tokens"],
+                response_format={"type": "json_object"},
+                stream=True,
+            )
+
+            chunks: List[str] = []
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    chunks.append(delta)
+                    if node is not None:
+                        node.live_tokens += 1
+                        if live is not None and node.live_tokens % 5 == 0:
+                            live.update(self.render_tree())
+
+            content = "".join(chunks)
+            if node is not None:
+                node.live_tokens = 0
+                if live is not None:
+                    live.update(self.render_tree())
+
+            try:
+                parsed = extract_json_payload(content)
+                return schema.model_validate(parsed)
+            except Exception as e:
+                last_err = e
+                user_prompt += f"\n\nYour previous JSON was invalid ({e}). Return ONLY valid JSON matching the schema."
+        raise RuntimeError(f"Model failed to return valid structured output: {last_err}")
+
+    # --- Live Indented Number Renderer ---
+
+    def render_tree(self) -> Text:
+        status_styles = {
+            "PENDING": "[dim]PENDING[/dim]",
+            "PLANNING": "[cyan]PLANNING[/cyan]",
+            "DOING": "[bold yellow]DOING[/bold yellow]",
+            "TESTING": "[magenta]TESTING[/magenta]",
+            "RETRYING": "[bold orange1]RETRYING[/bold orange1]",
+            "DONE": "[bold green]DONE[/bold green]",
+            "FAILED": "[bold red]FAILED[/bold red]",
+        }
+
+        lines: List[str] = []
+
+        def add_lines(node_id: str) -> None:
+            node = self.nodes[node_id]
+            tag = status_styles.get(node.status, node.status)
+
+            # Show live token counter on active states, or child progress on pending parents
+            if node.status in ("PLANNING", "DOING", "TESTING", "RETRYING") and node.live_tokens > 0:
+                tag = f"{tag} [dim]({node.live_tokens} tok)[/dim]"
+
+            elif node.status == "PENDING" and node.children_ids:
+                done_count = sum(1 for cid in node.children_ids if self.nodes[cid].status == "DONE")
+
+                if done_count > 0:
+                    tag = f"{tag} [dim]({done_count}/{len(node.children_ids)})[/dim]"
+
+            file_hint = f" [dim]({node.file_path})[/dim]" if node.file_path else ""
+
+            lines.append(f"[bold]{node.id}.[/bold] {node.title}{file_hint}  {tag}")
+
+            for cid in node.children_ids:
+                add_lines(cid)
+
+        add_lines(self.root_id)
+
+        return Text.from_markup("\n".join(lines))
+
+    # --- Phase 1: Top-Down Contract-First Planning ---
+    def plan_node(self, node_id: str, live: Live) -> None:
+        node = self.nodes[node_id]
+        if node.depth >= self.config["max_depth"]:
+            return
+
+        node.status = "PLANNING"
+        live.update(self.render_tree())
+
+        parent_context = "None (this is the root task)."
+        if node.parent_id:
+            p = self.nodes[node.parent_id]
+            parent_context = f"Parent Task: {p.title}\nParent Test Criteria: {p.test_criteria}"
+
+        system_prompt = (
+            "You are a disciplined, general-purpose recursive task planner. Splitting a task is a LAST RESORT: "
+            "default to is_leaf=True if the task can be completed cleanly in one focused pass. "
+            "Never split a topic just because it can be subdivided; judge necessity against the Root Goal "
+            "and this node's share of the total scope. If you must split, create at most "
+            f"{self.config['max_children']} subtasks. Do NOT create an 'Assemble', 'Combine', or 'Finalize' "
+            "subtask—the parent node automatically integrates its children's outputs. Every child's "
+            "test_criteria must explicitly align with the parent's test_criteria. "
+            "If a Context Directory listing is provided, assign specific relative paths to read_files on the subtasks "
+            "that need to inspect them. If a subtask produces code or a script, assign file_path and an optional "
+            "shell verify_command (like 'bash -n script.sh' or 'pytest test_x.py'); leave verify_command null for prose or analysis."
+        )
+        context_map = ""
+        if node.depth == 0 and self.context_dir:
+            context_map = f"\n\nRead-Only Context Directory Files:\n{get_directory_tree(self.context_dir)}"
+
+        user_prompt = (
+            f"Root Goal (for scale only): {self.root_prompt}\n"
+            f"Current Depth: {node.depth} | Estimated Share of Total Scope: {node.scope_weight:.1f}%\n\n"
+            f"{parent_context}\n\n"
+            f"Current Task: {node.title}\n"
+            f"Description: {node.description}\n"
+            f"Current Test Criteria: {node.test_criteria}"
+            f"{context_map}"
+            f"Reference Files to Inspect:\n{read_context}\n"
+        )
+
+        plan: PlanResponse = self.call_model(system_prompt, user_prompt, PlanResponse, node=node, live=live)
+
+        if not plan.is_leaf and plan.subtasks:
+            subtasks = plan.subtasks[: self.config["max_children"]]
+            child_weight = node.scope_weight / len(subtasks)
+            created_ids: List[str] = []
+            for idx, spec in enumerate(subtasks, start=1):
+                cid = f"{node.id}.{idx}"
+                created_ids.append(cid)
+                self.nodes[cid] = TaskNode(
+                    id=cid,
+                    title=spec.title,
+                    description=spec.description,
+                    test_criteria=spec.test_criteria,
+                    parent_id=node.id,
+                    depth=node.depth + 1,
+                    scope_weight=child_weight,
+                    file_path=spec.file_path,
+                    read_files=spec.read_files,
+                    verify_command=spec.verify_command
+                )
+
+            # Resolve sibling DAG dependencies
+            for idx, spec in enumerate(subtasks):
+                cid = created_ids[idx]
+                for dep_idx in spec.depends_on_indices:
+                    if 0 <= dep_idx < len(created_ids) and dep_idx != idx:
+                        self.nodes[cid].depends_on.append(created_ids[dep_idx])
+
+            node.children_ids = created_ids
+
+        node.status = "PENDING"
+        self.save_checkpoint()
+        live.update(self.render_tree())
+
+        for cid in node.children_ids:
+            self.plan_node(cid, live)
+
+    # --- Phase 2: Bottom-Up Execution & Verification ---
+    def run_verify_command(self, command: str) -> tuple[bool, str]:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(self.workspace) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=self.workspace,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        passed = result.returncode == 0
+        output = (result.stdout + "\n" + result.stderr).strip()
+        return passed, output[-2000:]
+
+    def judge_output(self, node: TaskNode, live: Live) -> tuple[bool, str]:
+        """Isolated judge call seeing only the contract and the artifact."""
+        word_count = len(node.output.split())
+        system_prompt = (
+            "You are a strict, independent verifier. Evaluate whether the provided output completely "
+            "satisfies the test criteria. If the task mentions a target word count, trust the provided "
+            "Actual Word Count and treat it as approximate (within +/- 20%) unless an exact or strict "
+            "maximum length was explicitly required."
+        )
+        user_prompt = (
+            f"Task: {node.title}\n"
+            f"Test Criteria: {node.test_criteria}\n"
+            f"Actual Word Count: {word_count}\n\n"
+            f"Produced Output:\n{node.output}\n\n"
+            f"Assumptions Made: {node.assumptions}"
+        )
+        verdict: JudgeResponse = self.call_model(
+            system_prompt, user_prompt, JudgeResponse, temp=0.0, node=node, live=live
+        )
+        return verdict.passed, verdict.feedback
+
+    def gather_dependency_stubs(self, node: TaskNode) -> str:
+        """Pulls lightweight AST stubs (for code) or summaries (for prose) from completed dependencies."""
+        if not node.depends_on:
+            return "None."
+        blocks = []
+        for dep_id in node.depends_on:
+            dep = self.nodes[dep_id]
+            if dep.file_path and dep.file_path.endswith(".py"):
+                stub = extract_python_stub(self.workspace / dep.file_path)
+                blocks.append(f"--- Interface Stub for {dep.file_path} ({dep.title}) ---\n{stub}")
+            else:
+                blocks.append(f"--- Summary of Dependency '{dep.title}' ---\n{dep.summary}")
+        return "\n\n".join(blocks)
+
+    def execute_node(self, node_id: str, live: Live) -> None:
+        node = self.nodes[node_id]
+
+        # First ensure all children are done (respecting sibling depends_on DAG)
+        if node.children_ids:
+            remaining = list(node.children_ids)
+            while remaining:
+                progressed = False
+                for cid in list(remaining):
+                    child = self.nodes[cid]
+                    if all(self.nodes[d].status == "DONE" for d in child.depends_on):
+                        self.execute_node(cid, live)
+                        remaining.remove(cid)
+                        progressed = True
+                if not progressed:
+                    cid = remaining.pop(0)
+                    self.execute_node(cid, live)
+
+        parent_context = "None (this is the root task)."
+        if node.parent_id:
+            p = self.nodes[node.parent_id]
+            parent_context = f"Parent Task: {p.title}\nParent Test Criteria: {p.test_criteria}"
+
+        children_context = ""
+        is_code_integration = False
+        if node.children_ids:
+            parts = []
+            for cid in node.children_ids:
+                c = self.nodes[cid]
+                if c.file_path and c.file_path.endswith(".py"):
+                    is_code_integration = True
+                    stub = extract_python_stub(self.workspace / c.file_path)
+                    parts.append(
+                        f"Child {c.id} ({c.title}) -> {c.file_path}\n"
+                        f"Summary: {c.summary}\nAssumptions: {c.assumptions}\nInterface:\n{stub}"
+                    )
+                else:
+                    parts.append(
+                        f"Child {c.id} ({c.title})\nSummary: {c.summary}\n"
+                        f"Assumptions: {c.assumptions}\nContent:\n{c.output}"
+                    )
+            children_context = "\n\n".join(parts)
+
+        dep_context = self.gather_dependency_stubs(node)
+
+        for attempt in range(1, self.config["max_retries"] + 1):
+            node.status = "DOING" if attempt == 1 else "RETRYING"
+            node.retries = attempt - 1
+            live.update(self.render_tree())
+
+            integration_guidance = (
+                "If children outputs are provided, integrate them cleanly and check that their assumptions do not conflict. "
+                if is_code_integration or not node.children_ids
+                else (
+                    "You are integrating prose from completed child sections. Preserve the children's detailed "
+                    "writing and phrasing as faithfully as possible—stitch them together and smooth out transitions "
+                    "rather than rewriting them into a generic summary, unless a length constraint requires tightening. "
+                )
+            )
+
+            system_prompt = (
+                "You are executing a single node in a hierarchical task tree. Focus strictly on the "
+                "current task, honor the parent's contract, and satisfy the test criteria. "
+                f"{integration_guidance}"
+                "If file_path is specified, output complete, runnable code or full section content."
+            )
+
+            user_prompt = (
+                f"Root Goal (for scale only): {self.root_prompt}\n"
+                f"{parent_context}\n\n"
+                f"Current Task: {node.title}\n"
+                f"Description: {node.description}\n"
+                f"Test Criteria: {node.test_criteria}\n"
+                f"Target File: {node.file_path or 'None (prose/integration)'}\n"
+                f"Verify Command: {node.verify_command or 'None'}\n\n"
+                f"Sibling Dependencies:\n{dep_context}\n\n"
+                f"Reference Files to Inspect:\n{read_context}\n"
+            )
+            if children_context:
+                user_prompt += f"\nImmediate Children to Integrate:\n{children_context}\n"
+            if node.last_feedback:
+                user_prompt += f"\nPrevious Attempt Failed With:\n{node.last_feedback}\nFix this completely."
+
+            result: ExecutionResponse = self.call_model(
+                system_prompt, user_prompt, ExecutionResponse, node=node, live=live
+            )
+            node.output = result.output
+            node.summary = result.summary
+            node.assumptions = result.assumptions
+
+            # Write artifacts to disk if applicable
+            if node.file_path:
+                target = self.workspace / node.file_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(node.output, encoding="utf-8")
+
+            # Verify node
+            node.status = "TESTING"
+            live.update(self.render_tree())
+
+            if node.verify_command:
+                passed, feedback = self.run_verify_command(node.verify_command)
+            else:
+                passed, feedback = self.judge_output(node, live)
+
+            if passed:
+                node.status = "DONE"
+                node.last_feedback = ""
+                git_commit(self.workspace, f"Complete node {node.id}: {node.title}")
+                self.save_checkpoint()
+                live.update(self.render_tree())
+                return
+            else:
+                node.last_feedback = feedback
+
+        node.status = "FAILED"
+        self.save_checkpoint()
+        live.update(self.render_tree())
+
+    def run(self) -> None:
+        console = Console()
+        try:
+            with Live(self.render_tree(), console=console, refresh_per_second=6) as live:
+                self.plan_node(self.root_id, live)
+                self.execute_node(self.root_id, live)
+        except KeyboardInterrupt:
+            self.save_checkpoint()
+            console.print("\n[yellow]Interrupted. State saved to checkpoint.[/yellow]")
+            sys.exit(130)
+
+        root = self.nodes[self.root_id]
+        if self.output_file and root.output:
+            out_path = Path(self.output_file)
+            failed_nodes = [n for n in self.nodes.values() if n.status == "FAILED"]
+            for fn in failed_nodes:
+                console.print(f"\n[bold red]Node {fn.id} ({fn.title}) failed:[/bold red] {fn.last_feedback}")
+            out_path.write_text(root.output, encoding="utf-8")
+            console.print(f"\n[bold green]Saved final output to {out_path}[/bold green]")
+
+
+# ---------------------------------------------------------------------------
+# CLI & Config Loading
+# ---------------------------------------------------------------------------
+
+def load_config(rc_path: Path) -> Dict[str, Any]:
+    defaults = {
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "model": "qwen2.5:14b",
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "max_depth": 3,
+        "max_children": 4,
+        "max_retries": 3,
+        "workspace": "./tasktree_workspace",
+    }
+    if rc_path.exists():
+        parser = configparser.ConfigParser()
+        parser.read(rc_path)
+        if "model" in parser:
+            defaults["base_url"] = parser["model"].get("base_url", defaults["base_url"])
+            defaults["api_key"] = parser["model"].get("api_key", defaults["api_key"])
+            defaults["model"] = parser["model"].get("model", defaults["model"])
+            defaults["temperature"] = parser["model"].getfloat("temperature", defaults["temperature"])
+            defaults["max_tokens"] = parser["model"].getint("max_tokens", defaults["max_tokens"])
+        if "harness" in parser:
+            defaults["max_depth"] = parser["harness"].getint("max_depth", defaults["max_depth"])
+            defaults["max_children"] = parser["harness"].getint("max_children", defaults["max_children"])
+            defaults["max_retries"] = parser["harness"].getint("max_retries", defaults["max_retries"])
+            defaults["workspace"] = parser["harness"].get("workspace", defaults["workspace"])
+    return defaults
+
+
+def main() -> None:
+    argp = argparse.ArgumentParser(description="Recursive local-context task tree harness.")
+    argp.add_argument("prompt", help="Root task to plan and execute.")
+    argp.add_argument("-o", "--output", help="Optional file path to save the root node's final output.")
+    argp.add_argument("-w", "--workspace", help="Override workspace directory.")
+    argp.add_argument("--rc", default=str(Path.home() / ".tasktreerc"), help="Path to .tasktreerc file.")
+    argp.add_argument("-c", "--context", help="Optional read-only directory (e.g. an existing repo) to analyze.")
+    args = argp.parse_args()
+
+    config = load_config(Path(args.rc))
+    if args.workspace:
+        config["workspace"] = args.workspace
+
+    harness = TaskTreeHarness(config, args.prompt, output_file=args.output)
+    harness.run()
+
+
+if __name__ == "__main__":
+    main()

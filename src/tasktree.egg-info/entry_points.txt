@@ -1,0 +1,2 @@
+[console_scripts]
+tasktree = tasktree.main:main
