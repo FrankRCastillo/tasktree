@@ -337,18 +337,10 @@ class TaskTreeHarness:
             p = self.nodes[node.parent_id]
             parent_context = f"Parent Task: {p.title}\nParent Test Criteria: {p.test_criteria}"
 
-        system_prompt = (
-            "You are a disciplined, general-purpose recursive task planner. Splitting a task is a LAST RESORT: "
-            "default to is_leaf=True if the task can be completed cleanly in one focused pass. "
-            "Never split a topic just because it can be subdivided; judge necessity against the Root Goal "
-            "and this node's share of the total scope. If you must split, create at most "
-            f"{self.config['max_children']} subtasks. Do NOT create an 'Assemble', 'Combine', or 'Finalize' "
-            "subtask—the parent node automatically integrates its children's outputs. Every child's "
-            "test_criteria must explicitly align with the parent's test_criteria. "
-            "If a Context Directory listing is provided, assign specific relative paths to read_files on the subtasks "
-            "that need to inspect them. If a subtask produces code or a script, assign file_path and an optional "
-            "shell verify_command (like 'bash -n script.sh' or 'pytest test_x.py'); leave verify_command null for prose or analysis."
+        system_prompt = self.config["prompts"]["planner"].format(
+            max_children=self.config["max_children"]
         )
+
         context_map = ""
         if node.depth == 0 and self.context_dir:
             context_map = f"\n\nRead-Only Context Directory Files:\n{get_directory_tree(self.context_dir)}"
@@ -421,12 +413,8 @@ class TaskTreeHarness:
     def judge_output(self, node: TaskNode, live: Live) -> tuple[bool, str]:
         """Isolated judge call seeing only the contract and the artifact."""
         word_count = len(node.output.split())
-        system_prompt = (
-            "You are a strict, independent verifier. Evaluate whether the provided output completely "
-            "satisfies the test criteria. If the task mentions a target word count, trust the provided "
-            "Actual Word Count and treat it as approximate (within +/- 20%) unless an exact or strict "
-            "maximum length was explicitly required."
-        )
+        system_prompt = self.config["prompts"]["judge"]
+
         user_prompt = (
             f"Task: {node.title}\n"
             f"Test Criteria: {node.test_criteria}\n"
@@ -505,20 +493,13 @@ class TaskTreeHarness:
             live.update(self.render_tree())
 
             integration_guidance = (
-                "If children outputs are provided, integrate them cleanly and check that their assumptions do not conflict. "
+                self.config["prompts"]["code_integration"]
                 if is_code_integration or not node.children_ids
-                else (
-                    "You are integrating prose from completed child sections. Preserve the children's detailed "
-                    "writing and phrasing as faithfully as possible—stitch them together and smooth out transitions "
-                    "rather than rewriting them into a generic summary, unless a length constraint requires tightening. "
-                )
+                else self.config["prompts"]["prose_integration"]
             )
 
-            system_prompt = (
-                "You are executing a single node in a hierarchical task tree. Focus strictly on the "
-                "current task, honor the parent's contract, and satisfy the test criteria. "
-                f"{integration_guidance}"
-                "If file_path is specified, output complete, runnable code or full section content."
+            system_prompt = self.config["prompts"]["executor"].format(
+                integration_guidance=integration_guidance
             )
 
             user_prompt = (
@@ -597,52 +578,102 @@ class TaskTreeHarness:
 # ---------------------------------------------------------------------------
 # CLI & Config Loading
 # ---------------------------------------------------------------------------
+DEFAULT_RC_TEMPLATE = """[model]
+base_url = http://localhost:11434/v1
+api_key = ollama
+model = qwen2.5:14b
+temperature = 0.2
+max_tokens = 2048
+
+[harness]
+max_depth = 3
+max_children = 4
+max_retries = 3
+workspace = ./tasktree_workspace
+
+[prompts]
+planner =
+    You are a disciplined, general-purpose recursive task planner. Splitting a task is a LAST RESORT:
+    default to is_leaf=True if the task can be completed cleanly in one focused pass.
+    Never split a topic just because it can be subdivided; judge necessity against the Root Goal
+    and this node's share of the total scope. If you must split, create at most {max_children} subtasks.
+    Do NOT create an 'Assemble', 'Combine', or 'Finalize' subtask—the parent node automatically integrates
+    its children's outputs. Every child's test_criteria must explicitly align with the parent's test_criteria.
+    If a Context Directory listing is provided, assign specific relative paths to read_files on the subtasks
+    that need to inspect them. If a subtask produces code or a script, assign file_path and an optional
+    shell verify_command (like 'bash -n script.sh' or 'pytest test_x.py'); leave verify_command null for prose or analysis.
+
+executor =
+    You are executing a single node in a hierarchical task tree. Focus strictly on the
+    current task, honor the parent's contract, and satisfy the test criteria.
+    {integration_guidance}
+    If file_path is specified, output complete, runnable code or full section content.
+
+code_integration =
+    If children outputs are provided, integrate them cleanly and check that their assumptions do not conflict.
+
+prose_integration =
+    You are integrating prose from completed child sections. Preserve the children's detailed
+    writing and phrasing as faithfully as possible—stitch them together and smooth out transitions
+    rather than rewriting them into a generic summary, unless a length constraint requires tightening.
+
+judge =
+    You are a strict, independent verifier. Evaluate whether the provided output completely
+    satisfies the test criteria. If the task mentions a target word count, trust the provided
+    Actual Word Count and treat it as approximate (within +/- 20%) unless an exact or strict
+    maximum length was explicitly required.
+"""
 
 def load_config(rc_path: Path) -> Dict[str, Any]:
-    defaults = {
-        "base_url": "http://localhost:11434/v1",
-        "api_key": "ollama",
-        "model": "qwen2.5:14b",
-        "temperature": 0.2,
-        "max_tokens": 2048,
-        "max_depth": 3,
-        "max_children": 4,
-        "max_retries": 3,
-        "workspace": "./tasktree_workspace",
-    }
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(DEFAULT_RC_TEMPLATE)
     if rc_path.exists():
-        parser = configparser.ConfigParser()
         parser.read(rc_path)
-        if "model" in parser:
-            defaults["base_url"] = parser["model"].get("base_url", defaults["base_url"])
-            defaults["api_key"] = parser["model"].get("api_key", defaults["api_key"])
-            defaults["model"] = parser["model"].get("model", defaults["model"])
-            defaults["temperature"] = parser["model"].getfloat("temperature", defaults["temperature"])
-            defaults["max_tokens"] = parser["model"].getint("max_tokens", defaults["max_tokens"])
-        if "harness" in parser:
-            defaults["max_depth"] = parser["harness"].getint("max_depth", defaults["max_depth"])
-            defaults["max_children"] = parser["harness"].getint("max_children", defaults["max_children"])
-            defaults["max_retries"] = parser["harness"].getint("max_retries", defaults["max_retries"])
-            defaults["workspace"] = parser["harness"].get("workspace", defaults["workspace"])
-    return defaults
 
+    return {
+        "base_url": parser["model"]["base_url"],
+        "api_key": parser["model"]["api_key"],
+        "model": parser["model"]["model"],
+        "temperature": parser["model"].getfloat("temperature"),
+        "max_tokens": parser["model"].getint("max_tokens"),
+        "max_depth": parser["harness"].getint("max_depth"),
+        "max_children": parser["harness"].getint("max_children"),
+        "max_retries": parser["harness"].getint("max_retries"),
+        "workspace": parser["harness"]["workspace"],
+        "prompts": {
+            "planner": parser["prompts"]["planner"].strip(),
+            "executor": parser["prompts"]["executor"].strip(),
+            "code_integration": parser["prompts"]["code_integration"].strip(),
+            "prose_integration": parser["prompts"]["prose_integration"].strip(),
+            "judge": parser["prompts"]["judge"].strip(),
+        },
+    }
 
 def main() -> None:
     argp = argparse.ArgumentParser(description="Recursive local-context task tree harness.")
-    argp.add_argument("prompt", help="Root task to plan and execute.")
+    argp.add_argument("prompt", nargs="?", help="Root task to plan and execute.")
     argp.add_argument("-o", "--output", help="Optional file path to save the root node's final output.")
     argp.add_argument("-w", "--workspace", help="Override workspace directory.")
-    argp.add_argument("--rc", default=str(Path.home() / ".tasktreerc"), help="Path to .tasktreerc file.")
     argp.add_argument("-c", "--context", help="Optional read-only directory (e.g. an existing repo) to analyze.")
+    argp.add_argument("--rc", default=str(Path.home() / ".tasktreerc"), help="Path to .tasktreerc file.")
+    argp.add_argument("--init-config", action="store_true", help="Write or overwrite .tasktreerc with default settings and prompts.")
     args = argp.parse_args()
 
-    config = load_config(Path(args.rc))
+    rc_path = Path(args.rc)
+    if args.init_config:
+        rc_path.write_text(DEFAULT_RC_TEMPLATE.strip() + "\n", encoding="utf-8")
+        print(f"Wrote default configuration to {rc_path}")
+        return
+
+    if not args.prompt:
+        argp.error("the following arguments are required: prompt")
+
+    config = load_config(rc_path)
     if args.workspace:
         config["workspace"] = args.workspace
 
-    harness = TaskTreeHarness(config, args.prompt, output_file=args.output)
+    harness = TaskTreeHarness(config, args.prompt, output_file=args.output, context_dir=args.context)
     harness.run()
-
 
 if __name__ == "__main__":
     main()
