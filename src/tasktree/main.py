@@ -15,6 +15,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+from importlib.resources import files
+
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -27,31 +29,20 @@ from rich.text import Text
 # ---------------------------------------------------------------------------
 
 class SubtaskSpec(BaseModel):
-    reasoning: str = Field(description="Why this subtask is needed and how it fits the parent.")
-    title: str = Field(description="Short, clear name for the subtask.")
-    description: str = Field(description="Detailed instructions for what this subtask must produce.")
-    test_criteria: str = Field(description="Concrete pass/fail criteria aligned with the parent's test.")
-    depends_on_indices: List[int] = Field(
-        default_factory=list,
-        description="0-based indices of sibling subtasks in this same list that must finish before this one."
-    )
-    read_files: List[str] = Field(
-        default_factory=list,
-        description="Relative file paths to read from the read-only context directory (if analyzing an existing codebase or docs)."
-    )
-    file_path: Optional[str] = Field(
-        default=None,
-        description="Relative path in the workspace to write an artifact/script/code file if needed."
-    )
-    verify_command: Optional[str] = Field(
-        default=None,
-        description="Optional shell command to verify this node deterministically (e.g. 'bash -n script.sh', 'pytest test_x.py', 'python -m py_compile app.py'). Leave null for prose or analysis."
-    )
+    title: str
+    description: str
+    test_criteria: str
+    depends_on: List[int] = Field(default_factory=list)
+    file_path: Optional[str] = None
+    verify_command: Optional[str] = None
+    read_files: List[str] = Field(default_factory=list)
+
 
 class PlanResponse(BaseModel):
-    reasoning: str = Field(description="Evaluate whether this task fits in a single small context window or needs splitting.")
-    is_leaf: bool = Field(description="True if this task is small enough to execute directly; False if it must be split.")
-    subtasks: List[SubtaskSpec] = Field(default_factory=list, description="Ordered list of child subtasks if is_leaf is False.")
+    reasoning: str
+    is_leaf: bool
+    shared_invariants: str = ""
+    subtasks: List[SubtaskSpec] = Field(default_factory=list)
 
 class ExecutionResponse(BaseModel):
     reasoning: str = Field(description="Step-by-step reasoning to solve the task.")
@@ -578,55 +569,12 @@ class TaskTreeHarness:
 # ---------------------------------------------------------------------------
 # CLI & Config Loading
 # ---------------------------------------------------------------------------
-DEFAULT_RC_TEMPLATE = """[model]
-base_url = http://localhost:11434/v1
-api_key = ollama
-model = qwen2.5:14b
-temperature = 0.2
-max_tokens = 2048
-
-[harness]
-max_depth = 3
-max_children = 4
-max_retries = 3
-workspace = ./tasktree_workspace
-
-[prompts]
-planner =
-    You are a disciplined, general-purpose recursive task planner. Splitting a task is a LAST RESORT:
-    default to is_leaf=True if the task can be completed cleanly in one focused pass.
-    Never split a topic just because it can be subdivided; judge necessity against the Root Goal
-    and this node's share of the total scope. If you must split, create at most {max_children} subtasks.
-    Do NOT create an 'Assemble', 'Combine', or 'Finalize' subtask—the parent node automatically integrates
-    its children's outputs. Every child's test_criteria must explicitly align with the parent's test_criteria.
-    If a Context Directory listing is provided, assign specific relative paths to read_files on the subtasks
-    that need to inspect them. If a subtask produces code or a script, assign file_path and an optional
-    shell verify_command (like 'bash -n script.sh' or 'pytest test_x.py'); leave verify_command null for prose or analysis.
-
-executor =
-    You are executing a single node in a hierarchical task tree. Focus strictly on the
-    current task, honor the parent's contract, and satisfy the test criteria.
-    {integration_guidance}
-    If file_path is specified, output complete, runnable code or full section content.
-
-code_integration =
-    If children outputs are provided, integrate them cleanly and check that their assumptions do not conflict.
-
-prose_integration =
-    You are integrating prose from completed child sections. Preserve the children's detailed
-    writing and phrasing as faithfully as possible—stitch them together and smooth out transitions
-    rather than rewriting them into a generic summary, unless a length constraint requires tightening.
-
-judge =
-    You are a strict, independent verifier. Evaluate whether the provided output completely
-    satisfies the test criteria. If the task mentions a target word count, trust the provided
-    Actual Word Count and treat it as approximate (within +/- 20%) unless an exact or strict
-    maximum length was explicitly required.
-"""
+def get_default_rc() -> str:
+    return files("tasktree").joinpath("default_tasktreerc").read_text(encoding="utf-8")
 
 def load_config(rc_path: Path) -> Dict[str, Any]:
     parser = configparser.ConfigParser(interpolation=None)
-    parser.read_string(DEFAULT_RC_TEMPLATE)
+    parser.read_string(get_default_rc())
     if rc_path.exists():
         parser.read(rc_path)
 
@@ -661,7 +609,7 @@ def main() -> None:
 
     rc_path = Path(args.rc)
     if args.init_config:
-        rc_path.write_text(DEFAULT_RC_TEMPLATE.strip() + "\n", encoding="utf-8")
+        rc_path.write_text(get_default_rc().strip() + "\n", encoding="utf-8")
         print(f"Wrote default configuration to {rc_path}")
         return
 
