@@ -371,7 +371,7 @@ class TaskTreeHarness:
             # Resolve sibling DAG dependencies
             for idx, spec in enumerate(subtasks):
                 cid = created_ids[idx]
-                for dep_idx in spec.depends_on_indices:
+                for dep_idx in spec.depends_on:
                     if 0 <= dep_idx < len(created_ids) and dep_idx != idx:
                         self.nodes[cid].depends_on.append(created_ids[dep_idx])
 
