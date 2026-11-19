@@ -361,7 +361,6 @@ class TaskTreeHarness:
             f"Description: {node.description}\n"
             f"Current Test Criteria: {node.test_criteria}"
             f"{context_map}"
-            f"Reference Files to Inspect:\n{read_context}\n"
         )
 
         plan: PlanResponse = self.call_model(system_prompt, user_prompt, PlanResponse, node=node, live=live)
@@ -498,6 +497,7 @@ class TaskTreeHarness:
             children_context = "\n\n".join(parts)
 
         dep_context = self.gather_dependency_stubs(node)
+        read_context = read_context_files(self.context_dir, node.read_files)
 
         for attempt in range(1, self.config["max_retries"] + 1):
             node.status = "DOING" if attempt == 1 else "RETRYING"
