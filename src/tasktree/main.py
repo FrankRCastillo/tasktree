@@ -87,6 +87,7 @@ class TaskNode:
     last_feedback: str = ""
     retries: int = 0
     live_tokens: int = 0
+    shared_invariants: str = ""
 
 # ---------------------------------------------------------------------------
 # Helper Utilities (AST Stubbing, Git Checkpoints, JSON Parsing)
