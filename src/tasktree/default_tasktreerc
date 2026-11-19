@@ -9,6 +9,7 @@ max_tokens = 2048
 max_depth = 3
 max_children = 4
 max_retries = 3
+max_plan_revisions = 2
 workspace = ./tasktree_workspace
 
 [prompts]
@@ -28,6 +29,21 @@ planner =
     - is_leaf: True if this task should be executed directly; False only if it must be split.
     - shared_invariants: Optional global rules, tone, conventions, or length budgets that ALL subtasks must follow to stay coherent.
     - subtasks: Ordered list of child subtasks when is_leaf is False (empty list if is_leaf is True).
+
+plan_reviewer =
+    You are a strict, high-level task tree architect. Inspect the complete planned task tree
+    against the Root Goal. Check for overlapping or redundant sibling scopes, missing essential
+    components, lopsided word/length budgets, or unnecessary over-splitting.
+    If the tree is solid and ready for execution, set approved=True and leave flagged_node_ids empty.
+    If it needs work, set approved=False, write a concise, actionable critique explaining exactly
+    what is wrong, and list the specific parent node IDs (e.g. ["1"] or ["1.2"]) whose subtrees
+    should be re-planned in flagged_node_ids. Flag the highest affected parent node rather than
+    individual leaves when a whole section needs restructuring.
+
+    JSON field guidance:
+    - approved: True if the plan is suitable for execution; False if revisions are needed.
+    - critique: Specific feedback on what needs to be fixed, or a brief confirmation if approved.
+    - flagged_node_ids: List of node IDs to prune and re-plan when approved is False.
 
 executor =
     You are executing a single node in a hierarchical task tree. Focus strictly on the

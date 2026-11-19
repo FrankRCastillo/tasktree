@@ -58,6 +58,10 @@ class JudgeResponse(BaseModel):
     passed: bool = Field(description="True only if all test criteria are satisfied.")
     feedback: str = Field(description="Specific, actionable feedback if passed is False.")
 
+class PlanReviewResponse(BaseModel):
+    approved: bool
+    critique: str
+    flagged_node_ids: List[str] = Field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # In-Memory Task Tree Node
@@ -285,6 +289,7 @@ class TaskTreeHarness:
             "RETRYING": "[bold orange1]RETRYING[/bold orange1]",
             "DONE": "[bold green]DONE[/bold green]",
             "FAILED": "[bold red]FAILED[/bold red]",
+            "REVIEWING": "[cyan]REVIEWING[/cyan]"
         }
 
         lines: List[str] = []
@@ -315,7 +320,7 @@ class TaskTreeHarness:
         return Text.from_markup("\n".join(lines))
 
     # --- Phase 1: Top-Down Contract-First Planning ---
-    def plan_node(self, node_id: str, live: Live) -> None:
+    def plan_node(self, node_id: str, live: Live, revision_feedback: str = "") -> None:
         node = self.nodes[node_id]
         if node.depth >= self.config["max_depth"]:
             return
@@ -336,6 +341,12 @@ class TaskTreeHarness:
         if node.depth == 0 and self.context_dir:
             context_map = f"\n\nRead-Only Context Directory Files:\n{get_directory_tree(self.context_dir)}"
 
+        feedback_block = (
+            f"\nRevision Feedback from Plan Reviewer (you MUST address this):\n{revision_feedback}\n"
+            if revision_feedback
+            else ""
+        )
+
         user_prompt = (
             f"Root Goal (for scale only): {self.root_prompt}\n"
             f"Current Depth: {node.depth} | Estimated Share of Total Scope: {node.scope_weight:.1f}%\n\n"
@@ -344,6 +355,7 @@ class TaskTreeHarness:
             f"Description: {node.description}\n"
             f"Current Test Criteria: {node.test_criteria}"
             f"{context_map}"
+            f"{feedback_block}"
         )
 
         plan: PlanResponse = self.call_model(system_prompt, user_prompt, PlanResponse, node=node, live=live)
@@ -550,7 +562,9 @@ class TaskTreeHarness:
         try:
             with Live(self.render_tree(), console=console, refresh_per_second=6) as live:
                 self.plan_node(self.root_id, live)
+                self.review_and_revise_plan(live)
                 self.execute_node(self.root_id, live)
+
         except KeyboardInterrupt:
             self.save_checkpoint()
             console.print("\n[yellow]Interrupted. State saved to checkpoint.[/yellow]")
@@ -565,6 +579,72 @@ class TaskTreeHarness:
             out_path.write_text(root.output, encoding="utf-8")
             console.print(f"\n[bold green]Saved final output to {out_path}[/bold green]")
 
+    def serialize_tree_outline(self, node_id: Optional[str] = None, level: int = 0) -> str:
+        nid = node_id or self.root_id
+        node = self.nodes[nid]
+        pad = "  " * level
+        lines = [
+            f"{pad}- {node.id}. {node.title}",
+            f"{pad}  Description: {node.description}",
+            f"{pad}  Test Criteria: {node.test_criteria}",
+        ]
+        if node.shared_invariants:
+            lines.append(f"{pad}  Shared Invariants: {node.shared_invariants}")
+        for cid in node.children_ids:
+            lines.append(self.serialize_tree_outline(cid, level + 1))
+        return "\n".join(lines)
+
+    def prune_subtree(self, node_id: str) -> None:
+        node = self.nodes[node_id]
+        for cid in list(node.children_ids):
+            self.prune_subtree(cid)
+            self.nodes.pop(cid, None)
+        node.children_ids = []
+        node.shared_invariants = ""
+
+    def review_and_revise_plan(self, live: Live) -> None:
+        max_revs = self.config.get("max_plan_revisions", 0)
+        if max_revs <= 0:
+            return
+
+        root = self.nodes[self.root_id]
+        for _ in range(max_revs):
+            root.status = "REVIEWING"
+            live.update(self.render_tree())
+
+            system_prompt = self.config["prompts"]["plan_reviewer"]
+            user_prompt = (
+                f"Root Goal: {self.root_prompt}\n\n"
+                f"Proposed Task Tree:\n{self.serialize_tree_outline()}\n"
+            )
+            review: PlanReviewResponse = self.call_model(
+                system_prompt, user_prompt, PlanReviewResponse
+            )
+
+            if review.approved or not review.flagged_node_ids:
+                break
+
+            valid_flagged = [nid for nid in review.flagged_node_ids if nid in self.nodes]
+            if not valid_flagged:
+                break
+
+            # Only re-plan the highest flagged ancestors so we don't re-plan nodes already wiped by a parent
+            flagged_set = set(valid_flagged)
+            top_level_flagged = []
+            for nid in valid_flagged:
+                curr = self.nodes[nid].parent_id
+                has_flagged_ancestor = False
+                while curr:
+                    if curr in flagged_set:
+                        has_flagged_ancestor = True
+                        break
+                    curr = self.nodes[curr].parent_id
+                if not has_flagged_ancestor:
+                    top_level_flagged.append(nid)
+
+            for nid in top_level_flagged:
+                self.prune_subtree(nid)
+                self.plan_node(nid, live, revision_feedback=review.critique)
 
 # ---------------------------------------------------------------------------
 # CLI & Config Loading
@@ -588,12 +668,14 @@ def load_config(rc_path: Path) -> Dict[str, Any]:
         "max_children": parser["harness"].getint("max_children"),
         "max_retries": parser["harness"].getint("max_retries"),
         "workspace": parser["harness"]["workspace"],
+        "max_plan_revisions": parser["harness"].getint("max_plan_revisions"),
         "prompts": {
             "planner": parser["prompts"]["planner"].strip(),
             "executor": parser["prompts"]["executor"].strip(),
             "code_integration": parser["prompts"]["code_integration"].strip(),
             "prose_integration": parser["prompts"]["prose_integration"].strip(),
             "judge": parser["prompts"]["judge"].strip(),
+            "plan_reviewer": parser["prompts"]["plan_reviewer"].strip(),
         },
     }
 
