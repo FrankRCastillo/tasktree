@@ -1,3 +1,9 @@
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+tasktree = ["default_tasktreerc"]
+
 [model]
 base_url = http://localhost:11434/v1
 api_key = ollama
