@@ -32,7 +32,10 @@ class SubtaskSpec(BaseModel):
     title: str
     description: str
     test_criteria: str
-    depends_on: List[int] = Field(default_factory=list)
+    depends_on: List[int] = Field(
+        default_factory=list,
+        description="0-based indices into this subtasks list (the first sibling is 0) that must finish first."
+    )
     file_path: Optional[str] = None
     verify_command: Optional[str] = None
     read_files: List[str] = Field(default_factory=list)
@@ -144,13 +147,20 @@ def get_directory_tree(root: Path, max_files: int = 150) -> str:
     return "\n".join(paths) if paths else "(empty directory)"
 
 
+def resolve_within(root: Path, rel: str) -> Optional[Path]:
+    """Resolves rel under root, or returns None if it would escape root (via '..', an absolute path, or a symlink)."""
+    root = root.resolve()
+    target = (root / rel).resolve()
+    return target if target.is_relative_to(root) and target != root else None
+
+
 def read_context_files(context_dir: Optional[Path], rel_paths: List[str], max_chars_per_file: int = 8000) -> str:
     if not context_dir or not rel_paths:
         return "None."
     blocks = []
     for rel in rel_paths:
-        target = (context_dir / rel).resolve()
-        if not str(target).startswith(str(context_dir.resolve())) or not target.is_file():
+        target = resolve_within(context_dir, rel)
+        if target is None or not target.is_file():
             continue
         try:
             text = target.read_text(encoding="utf-8", errors="replace")
@@ -192,9 +202,15 @@ def extract_json_payload(raw_text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class TaskTreeHarness:
-    def __init__(self, config: Dict[str, Any], root_prompt: str, output_file: Optional[str] = None, context_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        root_prompt: Optional[str],
+        output_file: Optional[str] = None,
+        context_dir: Optional[str] = None,
+        resume: bool = False,
+    ):
         self.config = config
-        self.root_prompt = root_prompt
         self.workspace = Path(config["workspace"]).resolve()
         self.output_file = output_file
         self.checkpoint_path = self.workspace / ".tasktree_state.json"
@@ -205,21 +221,60 @@ class TaskTreeHarness:
         )
         self.nodes: Dict[str, TaskNode] = {}
         self.root_id = "1"
-        self.nodes[self.root_id] = TaskNode(
-            id=self.root_id,
-            title=root_prompt,
-            description=root_prompt,
-            test_criteria=f"Fully and accurately satisfies the user's root request: {root_prompt}",
-            depth=0,
-            scope_weight=100.0,
-        )
+        self.planned = False
         self.context_dir = Path(context_dir).resolve() if context_dir else None
+
+        if resume:
+            self.load_checkpoint()
+        else:
+            if not root_prompt:
+                raise ValueError("root_prompt is required unless resuming")
+            self.root_prompt = root_prompt
+            self.nodes[self.root_id] = TaskNode(
+                id=self.root_id,
+                title=root_prompt,
+                description=root_prompt,
+                test_criteria=f"Fully and accurately satisfies the user's root request: {root_prompt}",
+                depth=0,
+                scope_weight=100.0,
+            )
 
         init_git_workspace(self.workspace)
 
     def save_checkpoint(self) -> None:
-        data = {nid: asdict(node) for nid, node in self.nodes.items()}
+        data = {
+            "root_prompt": self.root_prompt,
+            "planned": self.planned,
+            "context_dir": str(self.context_dir) if self.context_dir else None,
+            "nodes": {nid: asdict(node) for nid, node in self.nodes.items()},
+        }
         self.checkpoint_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def load_checkpoint(self) -> None:
+        """Restores a saved run. DONE nodes are kept; everything else is reset to PENDING and re-run."""
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"No checkpoint found at {self.checkpoint_path}")
+        data = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        if "nodes" not in data:
+            raise ValueError(f"{self.checkpoint_path} predates resume support and cannot be resumed")
+        self.root_prompt = data["root_prompt"]
+        self.planned = data["planned"]
+        if self.context_dir is None and data.get("context_dir"):
+            self.context_dir = Path(data["context_dir"])
+        self.nodes = {nid: TaskNode(**fields) for nid, fields in data["nodes"].items()}
+        if not self.planned:
+            # Planning was interrupted mid-tree; start the plan over from the root
+            root = self.nodes[self.root_id]
+            self.prune_subtree(self.root_id)
+            self.nodes = {self.root_id: root}
+        for node in self.nodes.values():
+            node.live_tokens = 0
+            if node.status != "DONE":
+                node.status = "PENDING"
+
+    def warn(self, live: Optional[Live], message: str) -> None:
+        if live is not None:
+            live.console.print(f"[yellow]{message}[/yellow]")
 
     def call_model(
         self,
@@ -320,6 +375,17 @@ class TaskTreeHarness:
 
         return Text.from_markup("\n".join(lines))
 
+    def inherited_invariants(self, node: TaskNode) -> str:
+        """Collects shared_invariants set by every ancestor, root first."""
+        chain: List[str] = []
+        curr = node.parent_id
+        while curr:
+            parent = self.nodes[curr]
+            if parent.shared_invariants:
+                chain.append(f"From {parent.id} ({parent.title}): {parent.shared_invariants}")
+            curr = parent.parent_id
+        return "\n".join(reversed(chain)) if chain else "None."
+
     # --- Phase 1: Top-Down Contract-First Planning ---
     def plan_node(self, node_id: str, live: Live, revision_feedback: str = "") -> None:
         node = self.nodes[node_id]
@@ -354,20 +420,31 @@ class TaskTreeHarness:
             f"{parent_context}\n\n"
             f"Current Task: {node.title}\n"
             f"Description: {node.description}\n"
-            f"Current Test Criteria: {node.test_criteria}"
+            f"Current Test Criteria: {node.test_criteria}\n"
+            f"Shared Invariants (from ancestors, must be honored):\n{self.inherited_invariants(node)}"
             f"{context_map}"
             f"{feedback_block}"
         )
 
-        plan: PlanResponse = self.call_model(system_prompt, user_prompt, PlanResponse, node=node, live=live)
+        try:
+            plan: Optional[PlanResponse] = self.call_model(
+                system_prompt, user_prompt, PlanResponse, node=node, live=live
+            )
+        except Exception as e:
+            self.warn(live, f"Planning failed for node {node.id}; treating it as a leaf. ({e})")
+            plan = None
 
-        if not plan.is_leaf and plan.subtasks:
+        if plan is not None and not plan.is_leaf and plan.subtasks:
+            node.shared_invariants = plan.shared_invariants
             subtasks = plan.subtasks[: self.config["max_children"]]
             child_weight = node.scope_weight / len(subtasks)
             created_ids: List[str] = []
             for idx, spec in enumerate(subtasks, start=1):
                 cid = f"{node.id}.{idx}"
                 created_ids.append(cid)
+                if spec.file_path and resolve_within(self.workspace, spec.file_path) is None:
+                    self.warn(live, f"Node {cid}: dropping file_path {spec.file_path!r} (outside the workspace).")
+                    spec.file_path = None
                 self.nodes[cid] = TaskNode(
                     id=cid,
                     title=spec.title,
@@ -401,15 +478,18 @@ class TaskTreeHarness:
     def run_verify_command(self, command: str) -> tuple[bool, str]:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(self.workspace) + os.pathsep + env.get("PYTHONPATH", "")
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"Verify command timed out after 60s: {command}"
         passed = result.returncode == 0
         output = (result.stdout + "\n" + result.stderr).strip()
         return passed, output[-2000:]
@@ -447,6 +527,8 @@ class TaskTreeHarness:
 
     def execute_node(self, node_id: str, live: Live) -> None:
         node = self.nodes[node_id]
+        if node.status == "DONE":
+            return  # Already completed in a resumed run
 
         # First ensure all children are done (respecting sibling depends_on DAG)
         if node.children_ids:
@@ -490,6 +572,7 @@ class TaskTreeHarness:
 
         dep_context = self.gather_dependency_stubs(node)
         read_context = read_context_files(self.context_dir, node.read_files)
+        invariants = self.inherited_invariants(node)
 
         for attempt in range(1, self.config["max_retries"] + 1):
             node.status = "DOING" if attempt == 1 else "RETRYING"
@@ -514,6 +597,7 @@ class TaskTreeHarness:
                 f"Test Criteria: {node.test_criteria}\n"
                 f"Target File: {node.file_path or 'None (prose/integration)'}\n"
                 f"Verify Command: {node.verify_command or 'None'}\n\n"
+                f"Shared Invariants (from ancestors, must be honored):\n{invariants}\n\n"
                 f"Sibling Dependencies:\n{dep_context}\n\n"
                 f"Reference Files to Inspect:\n{read_context}\n"
             )
@@ -522,27 +606,33 @@ class TaskTreeHarness:
             if node.last_feedback:
                 user_prompt += f"\nPrevious Attempt Failed With:\n{node.last_feedback}\nFix this completely."
 
-            result: ExecutionResponse = self.call_model(
-                system_prompt, user_prompt, ExecutionResponse, node=node, live=live
-            )
-            node.output = result.output
-            node.summary = result.summary
-            node.assumptions = result.assumptions
+            try:
+                result: ExecutionResponse = self.call_model(
+                    system_prompt, user_prompt, ExecutionResponse, node=node, live=live
+                )
+                node.output = result.output
+                node.summary = result.summary
+                node.assumptions = result.assumptions
 
-            # Write artifacts to disk if applicable
-            if node.file_path:
-                target = self.workspace / node.file_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(node.output, encoding="utf-8")
+                # Write artifacts to disk if applicable
+                if node.file_path:
+                    target = resolve_within(self.workspace, node.file_path)
+                    if target is None:
+                        raise ValueError(f"file_path {node.file_path!r} is outside the workspace")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(node.output, encoding="utf-8")
 
-            # Verify node
-            node.status = "TESTING"
-            live.update(self.render_tree())
+                # Verify node
+                node.status = "TESTING"
+                live.update(self.render_tree())
 
-            if node.verify_command:
-                passed, feedback = self.run_verify_command(node.verify_command)
-            else:
-                passed, feedback = self.judge_output(node, live)
+                if node.verify_command:
+                    passed, feedback = self.run_verify_command(node.verify_command)
+                else:
+                    passed, feedback = self.judge_output(node, live)
+            except Exception as e:
+                self.warn(live, f"Node {node.id} attempt {attempt} errored: {e}")
+                passed, feedback = False, f"The previous attempt errored before it could be verified: {e}"
 
             if passed:
                 node.status = "DONE"
@@ -562,21 +652,30 @@ class TaskTreeHarness:
         console = Console()
         try:
             with Live(self.render_tree(), console=console, refresh_per_second=6) as live:
-                self.plan_node(self.root_id, live)
-                self.review_and_revise_plan(live)
+                if not self.planned:
+                    self.plan_node(self.root_id, live)
+                    self.review_and_revise_plan(live)
+                    self.planned = True
+                    self.save_checkpoint()
                 self.execute_node(self.root_id, live)
 
         except KeyboardInterrupt:
             self.save_checkpoint()
-            console.print("\n[yellow]Interrupted. State saved to checkpoint.[/yellow]")
+            console.print(
+                f"\n[yellow]Interrupted. State saved to {self.checkpoint_path}; "
+                f"continue with: tasktree --resume -w {self.workspace}[/yellow]"
+            )
             sys.exit(130)
+
+        failed_nodes = [n for n in self.nodes.values() if n.status == "FAILED"]
+        for fn in failed_nodes:
+            console.print(f"\n[bold red]Node {fn.id} ({fn.title}) failed:[/bold red] {fn.last_feedback}")
+        if failed_nodes:
+            console.print(f"\n[yellow]{len(failed_nodes)} node(s) failed; rerun them with: tasktree --resume -w {self.workspace}[/yellow]")
 
         root = self.nodes[self.root_id]
         if self.output_file and root.output:
             out_path = Path(self.output_file)
-            failed_nodes = [n for n in self.nodes.values() if n.status == "FAILED"]
-            for fn in failed_nodes:
-                console.print(f"\n[bold red]Node {fn.id} ({fn.title}) failed:[/bold red] {fn.last_feedback}")
             out_path.write_text(root.output, encoding="utf-8")
             console.print(f"\n[bold green]Saved final output to {out_path}[/bold green]")
 
@@ -609,7 +708,15 @@ class TaskTreeHarness:
             return
 
         root = self.nodes[self.root_id]
-        for _ in range(max_revs):
+        try:
+            self._review_rounds(root, max_revs, live)
+        finally:
+            root.status = "PENDING"
+            live.update(self.render_tree())
+
+    def _review_rounds(self, root: TaskNode, max_revs: int, live: Live) -> None:
+        # One more review than revisions, so the final revision is also checked
+        for round_idx in range(max_revs + 1):
             root.status = "REVIEWING"
             live.update(self.render_tree())
 
@@ -618,16 +725,24 @@ class TaskTreeHarness:
                 f"Root Goal: {self.root_prompt}\n\n"
                 f"Proposed Task Tree:\n{self.serialize_tree_outline()}\n"
             )
-            review: PlanReviewResponse = self.call_model(
-                system_prompt, user_prompt, PlanReviewResponse
-            )
+            try:
+                review: PlanReviewResponse = self.call_model(
+                    system_prompt, user_prompt, PlanReviewResponse
+                )
+            except Exception as e:
+                self.warn(live, f"Plan review failed; executing the current plan. ({e})")
+                return
 
             if review.approved or not review.flagged_node_ids:
-                break
+                return
+
+            if round_idx == max_revs:
+                self.warn(live, f"Plan still not approved after {max_revs} revision(s): {review.critique}")
+                return
 
             valid_flagged = [nid for nid in review.flagged_node_ids if nid in self.nodes]
             if not valid_flagged:
-                break
+                return
 
             # Only re-plan the highest flagged ancestors so we don't re-plan nodes already wiped by a parent
             flagged_set = set(valid_flagged)
@@ -688,6 +803,7 @@ def main() -> None:
     argp.add_argument("-c", "--context", help="Optional read-only directory (e.g. an existing repo) to analyze.")
     argp.add_argument("--rc", default=str(Path.home() / ".tasktreerc"), help="Path to .tasktreerc file.")
     argp.add_argument("--init-config", action="store_true", help="Write or overwrite .tasktreerc with default settings and prompts.")
+    argp.add_argument("--resume", action="store_true", help="Resume the run checkpointed in the workspace, re-running any node not DONE.")
     args = argp.parse_args()
 
     rc_path = Path(args.rc)
@@ -696,14 +812,21 @@ def main() -> None:
         print(f"Wrote default configuration to {rc_path}")
         return
 
-    if not args.prompt:
+    if args.resume and args.prompt:
+        argp.error("--resume takes the prompt from the checkpoint; do not pass one")
+    if not args.prompt and not args.resume:
         argp.error("the following arguments are required: prompt")
 
     config = load_config(rc_path)
     if args.workspace:
         config["workspace"] = args.workspace
 
-    harness = TaskTreeHarness(config, args.prompt, output_file=args.output, context_dir=args.context)
+    try:
+        harness = TaskTreeHarness(
+            config, args.prompt, output_file=args.output, context_dir=args.context, resume=args.resume
+        )
+    except (FileNotFoundError, ValueError) as e:
+        argp.error(str(e))
     harness.run()
 
 if __name__ == "__main__":

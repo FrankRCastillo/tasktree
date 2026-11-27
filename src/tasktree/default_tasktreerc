@@ -29,6 +29,7 @@ planner =
     - is_leaf: True if this task should be executed directly; False only if it must be split.
     - shared_invariants: Optional global rules, tone, conventions, or length budgets that ALL subtasks must follow to stay coherent.
     - subtasks: Ordered list of child subtasks when is_leaf is False (empty list if is_leaf is True).
+      Each subtask's depends_on lists 0-based sibling indices (the first subtask is 0).
 
 plan_reviewer =
     You are a strict, high-level task tree architect. Inspect the complete planned task tree
