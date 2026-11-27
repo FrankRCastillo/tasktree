@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
 tasktree: A strictly local, contract-first recursive reasoning harness for LLMs.
+
+Every node is an agent that either does its task itself (worker) or splits it
+across subordinates (manager). Context flows down, reports flow up: a worker
+sees its chain of command's intent, the shared invariants, and what its peers
+are doing, so its work fits beside theirs. A manager never rewrites that work;
+it judges its subordinates from their summaries and objective measurements,
+sends targeted revisions, and its deliverable is their content joined in order.
+No single model call ever has to hold the whole project.
 """
 
 import argparse
 import ast
 import configparser
+import dataclasses
 import json
 import os
 import re
@@ -13,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 
 from importlib.resources import files
 
@@ -23,9 +32,12 @@ from rich.console import Console
 from rich.live import Live
 from rich.text import Text
 
+# How much of the preceding section a worker sees so its content can continue from it
+PRECEDING_TAIL_CHARS = 1500
+
 
 # ---------------------------------------------------------------------------
-# Structured Output Schemas (reasoning first so Qwen can think before acting)
+# Structured Output Schemas (reasoning first so the model can think before acting)
 # ---------------------------------------------------------------------------
 
 class SubtaskSpec(BaseModel):
@@ -41,30 +53,28 @@ class SubtaskSpec(BaseModel):
     read_files: List[str] = Field(default_factory=list)
 
 
-class PlanResponse(BaseModel):
-    reasoning: str
-    is_leaf: bool
-    shared_invariants: str = ""
-    subtasks: List[SubtaskSpec] = Field(default_factory=list)
+class AgentResponse(BaseModel):
+    reasoning: str = Field(description="Brief explanation of why you chose worker or manager mode.")
+    mode: Literal["worker", "manager"]
+    shared_invariants: str = Field("", description="(manager only) Global rules or conventions all subtasks must follow.")
+    subtasks: List[SubtaskSpec] = Field(default_factory=list, description="(manager only) Ordered list of child subtasks.")
+    content: str = Field("", description="(worker only) Complete text or source code of the deliverable.")
+    summary: str = Field("", description="(worker only) Concise report of what was produced, for your manager.")
+    file_path: Optional[str] = Field(None, description="(worker only, optional) Relative workspace path if writing a named file.")
+    verify_command: Optional[str] = Field(None, description="(worker only, optional) Shell command to verify code/script output.")
 
-class ExecutionResponse(BaseModel):
-    reasoning: str = Field(description="Step-by-step reasoning to solve the task.")
-    output: str = Field(description="The final prose, analysis, script, or source code for this node.")
-    summary: str = Field(description="Tight, 2-4 sentence summary of what was built or concluded, for the parent.")
-    assumptions: List[str] = Field(
-        default_factory=list,
-        description="Short list of key assumptions or caveats made so the parent can check for conflicts."
-    )
 
-class JudgeResponse(BaseModel):
-    reasoning: str = Field(description="Strict evaluation of the output against the test criteria.")
-    passed: bool = Field(description="True only if all test criteria are satisfied.")
-    feedback: str = Field(description="Specific, actionable feedback if passed is False.")
+class Revision(BaseModel):
+    node_id: str
+    feedback: str
 
-class PlanReviewResponse(BaseModel):
+
+class ManagerReviewResponse(BaseModel):
+    reasoning: str = Field(description="Evaluation of the subordinates' reports against your task and test criteria.")
     approved: bool
-    critique: str
-    flagged_node_ids: List[str] = Field(default_factory=list)
+    summary: str = Field(description="Concise report of what your branch accomplished, to pass up to your manager.")
+    revisions: List[Revision] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # In-Memory Task Tree Node
@@ -84,13 +94,14 @@ class TaskNode:
     read_files: List[str] = field(default_factory=list)
     file_path: Optional[str] = None
     verify_command: Optional[str] = None
-    output: str = ""
-    summary: str = ""
-    assumptions: List[str] = field(default_factory=list)
-    last_feedback: str = ""
-    retries: int = 0
-    live_tokens: int = 0
     shared_invariants: str = ""
+    output: str = ""  # Worker: its content. Manager: its children's aggregated content.
+    summary: str = ""
+    verify_status: str = ""  # "", "passed" or "failed"
+    verify_output: str = ""
+    last_feedback: str = ""
+    live_tokens: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Helper Utilities (AST Stubbing, Git Checkpoints, JSON Parsing)
@@ -171,6 +182,10 @@ def read_context_files(context_dir: Optional[Path], rel_paths: List[str], max_ch
             blocks.append(f"--- File: {rel} (unreadable: {e}) ---")
     return "\n\n".join(blocks) if blocks else "None."
 
+def word_count(text: str) -> int:
+    """Matches `wc -w`: whitespace-separated tokens."""
+    return len(text.split())
+
 def init_git_workspace(workspace: Path) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
     if not (workspace / ".git").exists():
@@ -221,7 +236,6 @@ class TaskTreeHarness:
         )
         self.nodes: Dict[str, TaskNode] = {}
         self.root_id = "1"
-        self.planned = False
         self.context_dir = Path(context_dir).resolve() if context_dir else None
 
         if resume:
@@ -244,38 +258,34 @@ class TaskTreeHarness:
     def save_checkpoint(self) -> None:
         data = {
             "root_prompt": self.root_prompt,
-            "planned": self.planned,
             "context_dir": str(self.context_dir) if self.context_dir else None,
             "nodes": {nid: asdict(node) for nid, node in self.nodes.items()},
         }
         self.checkpoint_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def load_checkpoint(self) -> None:
-        """Restores a saved run. DONE nodes are kept; everything else is reset to PENDING and re-run."""
+        """Restores a saved run. DONE nodes are kept; everything else is reset to PENDING and re-run.
+        Managers keep the subtasks they already created."""
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"No checkpoint found at {self.checkpoint_path}")
         data = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
         if "nodes" not in data:
             raise ValueError(f"{self.checkpoint_path} predates resume support and cannot be resumed")
         self.root_prompt = data["root_prompt"]
-        self.planned = data["planned"]
         if self.context_dir is None and data.get("context_dir"):
             self.context_dir = Path(data["context_dir"])
-        self.nodes = {nid: TaskNode(**fields) for nid, fields in data["nodes"].items()}
-        if not self.planned:
-            # Planning was interrupted mid-tree; start the plan over from the root
-            root = self.nodes[self.root_id]
-            self.prune_subtree(self.root_id)
-            self.nodes = {self.root_id: root}
+        known = {f.name for f in dataclasses.fields(TaskNode)}
+        self.nodes = {
+            nid: TaskNode(**{k: v for k, v in fields.items() if k in known})
+            for nid, fields in data["nodes"].items()
+        }
         for node in self.nodes.values():
             node.live_tokens = 0
             if node.status != "DONE":
                 node.status = "PENDING"
-                # Ancestors integrated incomplete work, so they must re-run too
-                curr = node.parent_id
-                while curr:
-                    self.nodes[curr].status = "PENDING"
-                    curr = self.nodes[curr].parent_id
+                # Ancestors aggregated incomplete work, so they must re-run too
+                for ancestor in self.ancestors(node):
+                    ancestor.status = "PENDING"
 
     def warn(self, live: Optional[Live], message: str) -> None:
         if live is not None:
@@ -317,9 +327,13 @@ class TaskTreeHarness:
 
             chunks: List[str] = []
             for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    chunks.append(delta)
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+                if delta.content:
+                    chunks.append(delta.content)
+                # Thinking models stream hidden reasoning separately; count it so progress stays visible
+                if delta.content or getattr(delta, "reasoning_content", None):
                     if node is not None:
                         node.live_tokens += 1
                         if live is not None and node.live_tokens % 5 == 0:
@@ -344,13 +358,13 @@ class TaskTreeHarness:
     def render_tree(self) -> Text:
         status_styles = {
             "PENDING": "[dim]PENDING[/dim]",
-            "PLANNING": "[cyan]PLANNING[/cyan]",
-            "DOING": "[bold yellow]DOING[/bold yellow]",
+            "WORKING": "[bold yellow]WORKING[/bold yellow]",
+            "REVISING": "[bold orange1]REVISING[/bold orange1]",
             "TESTING": "[magenta]TESTING[/magenta]",
-            "RETRYING": "[bold orange1]RETRYING[/bold orange1]",
+            "MANAGING": "[cyan]MANAGING[/cyan]",
+            "REVIEWING": "[bold cyan]REVIEWING[/bold cyan]",
             "DONE": "[bold green]DONE[/bold green]",
             "FAILED": "[bold red]FAILED[/bold red]",
-            "REVIEWING": "[cyan]REVIEWING[/cyan]"
         }
 
         lines: List[str] = []
@@ -359,15 +373,12 @@ class TaskTreeHarness:
             node = self.nodes[node_id]
             tag = status_styles.get(node.status, node.status)
 
-            # Show live token counter on active states, or child progress on pending parents
-            if node.status in ("PLANNING", "DOING", "TESTING", "RETRYING") and node.live_tokens > 0:
+            # Show live token counter on active calls, or subordinate progress on managers
+            if node.live_tokens > 0:
                 tag = f"{tag} [dim]({node.live_tokens} tok)[/dim]"
-
-            elif node.status == "PENDING" and node.children_ids:
+            elif node.children_ids and node.status in ("PENDING", "MANAGING", "REVIEWING"):
                 done_count = sum(1 for cid in node.children_ids if self.nodes[cid].status == "DONE")
-
-                if done_count > 0:
-                    tag = f"{tag} [dim]({done_count}/{len(node.children_ids)})[/dim]"
+                tag = f"{tag} [dim]({done_count}/{len(node.children_ids)})[/dim]"
 
             file_hint = f" [dim]({node.file_path})[/dim]" if node.file_path else ""
 
@@ -380,106 +391,358 @@ class TaskTreeHarness:
 
         return Text.from_markup("\n".join(lines))
 
-    def inherited_invariants(self, node: TaskNode) -> str:
-        """Collects shared_invariants set by every ancestor, root first."""
-        chain: List[str] = []
+    # --- Context Flowing Down: intent, invariants, peers ---
+
+    def ancestors(self, node: TaskNode) -> List[TaskNode]:
+        """Returns the chain of command above node, root first."""
+        chain: List[TaskNode] = []
         curr = node.parent_id
         while curr:
-            parent = self.nodes[curr]
-            if parent.shared_invariants:
-                chain.append(f"From {parent.id} ({parent.title}): {parent.shared_invariants}")
-            curr = parent.parent_id
-        return "\n".join(reversed(chain)) if chain else "None."
+            chain.append(self.nodes[curr])
+            curr = self.nodes[curr].parent_id
+        return list(reversed(chain))
 
-    # --- Phase 1: Top-Down Contract-First Planning ---
-    def plan_node(self, node_id: str, live: Live, revision_feedback: str = "") -> None:
-        node = self.nodes[node_id]
-        if node.depth >= self.config["max_depth"]:
-            return
-
-        node.status = "PLANNING"
-        live.update(self.render_tree())
-
-        parent_context = "None (this is the root task)."
-        if node.parent_id:
-            p = self.nodes[node.parent_id]
-            parent_context = f"Parent Task: {p.title}\nParent Test Criteria: {p.test_criteria}"
-
-        system_prompt = self.config["prompts"]["planner"].format(
-            max_children=self.config["max_children"]
+    def chain_of_command(self, node: TaskNode) -> str:
+        chain = self.ancestors(node)
+        if not chain:
+            return "None (you are the root task)."
+        return "\n".join(
+            f"{a.id}. {a.title}\n   Intent: {a.description}\n   Success Criteria: {a.test_criteria}"
+            for a in chain
         )
 
-        context_map = ""
-        if node.depth == 0 and self.context_dir:
-            context_map = f"\n\nRead-Only Context Directory Files:\n{get_directory_tree(self.context_dir)}"
+    def inherited_invariants(self, node: TaskNode) -> str:
+        """Collects shared_invariants set by every ancestor, root first."""
+        chain = [
+            f"From {a.id} ({a.title}): {a.shared_invariants}"
+            for a in self.ancestors(node)
+            if a.shared_invariants
+        ]
+        return "\n".join(chain) if chain else "None."
 
-        feedback_block = (
-            f"\nRevision Feedback from Plan Reviewer (you MUST address this):\n{revision_feedback}\n"
-            if revision_feedback
-            else ""
-        )
+    def sibling_overview(self, node: TaskNode) -> str:
+        """Lists the node's peers with their scopes, and the reports of peers that have finished."""
+        if not node.parent_id:
+            return "None (you are the root task)."
+        lines: List[str] = []
+        for sid in self.nodes[node.parent_id].children_ids:
+            s = self.nodes[sid]
+            marker = "  <-- you" if sid == node.id else ""
+            target = f" -> {s.file_path}" if s.file_path else ""
+            lines.append(f"{s.id}. {s.title}{target} [{s.status}]{marker}\n   Scope: {s.description}")
+            if sid != node.id and s.status == "DONE" and s.summary:
+                lines.append(f"   Report: {s.summary}")
+        return "\n".join(lines)
 
-        user_prompt = (
-            f"Root Goal (for scale only): {self.root_prompt}\n"
-            f"Current Depth: {node.depth} | Estimated Share of Total Scope: {node.scope_weight:.1f}%\n\n"
-            f"{parent_context}\n\n"
+    def preceding_content(self, node: TaskNode) -> str:
+        """Returns the end of the content that will sit directly before this node's in the aggregated
+        output, crossing up the tree when the node is the first section of its branch."""
+        curr = node
+        while curr.parent_id:
+            parent = self.nodes[curr.parent_id]
+            siblings = parent.children_ids
+            for sid in reversed(siblings[: siblings.index(curr.id)]):
+                s = self.nodes[sid]
+                if not s.file_path:
+                    return s.output[-PRECEDING_TAIL_CHARS:]
+            if parent.file_path:
+                return ""  # The parent's aggregate starts a separate file
+            curr = parent
+        return ""
+
+    def gather_dependency_stubs(self, node: TaskNode) -> str:
+        """Pulls lightweight AST stubs (for code) or summaries (for prose) from completed dependencies."""
+        if not node.depends_on:
+            return "None."
+        blocks = []
+        for dep_id in node.depends_on:
+            dep = self.nodes[dep_id]
+            target = resolve_within(self.workspace, dep.file_path) if dep.file_path else None
+            if target is not None and dep.file_path.endswith(".py"):
+                stub = extract_python_stub(target)
+                blocks.append(f"--- Interface Stub for {dep.file_path} ({dep.title}) ---\n{stub}")
+            else:
+                blocks.append(f"--- Summary of Dependency '{dep.title}' ---\n{dep.summary}")
+        return "\n\n".join(blocks)
+
+    def agent_system_prompt(self) -> str:
+        # replace rather than format, so literal braces in a custom prompt don't break it
+        return self.config["prompts"]["agent"].replace("{max_children}", str(self.config["max_children"]))
+
+    def agent_prompt(self, node: TaskNode, feedback: str = "", problem: str = "") -> str:
+        max_depth = self.config["max_depth"]
+        sections = [
+            f"Root Goal: {self.root_prompt}",
+            f"Your Position: node {node.id}, depth {node.depth} of max {max_depth} | "
+            f"Estimated Share of Total Scope: {node.scope_weight:.1f}%",
+        ]
+        if node.depth >= max_depth:
+            sections.append('You are at the maximum depth: you MUST choose mode="worker".')
+        sections += [
+            f"Chain of Command (your superiors' intent, root first):\n{self.chain_of_command(node)}",
+            f"Shared Invariants (must be honored):\n{self.inherited_invariants(node)}",
+            f"Sibling Overview (your peers under the same manager):\n{self.sibling_overview(node)}",
             f"Current Task: {node.title}\n"
             f"Description: {node.description}\n"
-            f"Current Test Criteria: {node.test_criteria}\n"
-            f"Shared Invariants (from ancestors, must be honored):\n{self.inherited_invariants(node)}"
-            f"{context_map}"
-            f"{feedback_block}"
-        )
+            f"Test Criteria: {node.test_criteria}\n"
+            f"Assigned File: {node.file_path or 'None'}\n"
+            f"Assigned Verify Command: {node.verify_command or 'None'}",
+            f"Dependencies (completed peers you build on):\n{self.gather_dependency_stubs(node)}",
+        ]
+        preceding = self.preceding_content(node)
+        if preceding:
+            sections.append(f"End of the Preceding Section (your content follows it directly):\n{preceding}")
+        if self.context_dir:
+            sections.append(f"Read-Only Context Directory Files:\n{get_directory_tree(self.context_dir)}")
+        sections.append(f"Reference Files to Inspect:\n{read_context_files(self.context_dir, node.read_files)}")
+        if (feedback or problem) and node.output:
+            sections.append(f"Your Previous Submission:\n{node.output}")
+        if feedback:
+            sections.append(f"Revision Feedback from your manager (address this directly):\n{feedback}")
+        if problem:
+            sections.append(f"Problem With Your Previous Attempt (fix this):\n{problem}")
+        return "\n\n".join(sections)
 
-        try:
-            plan: Optional[PlanResponse] = self.call_model(
-                system_prompt, user_prompt, PlanResponse, node=node, live=live
-            )
-        except Exception as e:
-            self.warn(live, f"Planning failed for node {node.id}; treating it as a leaf. ({e})")
-            plan = None
+    # --- Running Nodes ---
 
-        if plan is not None and not plan.is_leaf and plan.subtasks:
-            node.shared_invariants = plan.shared_invariants
-            subtasks = plan.subtasks[: self.config["max_children"]]
-            child_weight = node.scope_weight / len(subtasks)
-            created_ids: List[str] = []
-            for idx, spec in enumerate(subtasks, start=1):
-                cid = f"{node.id}.{idx}"
-                created_ids.append(cid)
-                if spec.file_path and resolve_within(self.workspace, spec.file_path) is None:
-                    self.warn(live, f"Node {cid}: dropping file_path {spec.file_path!r} (outside the workspace).")
-                    spec.file_path = None
-                self.nodes[cid] = TaskNode(
-                    id=cid,
-                    title=spec.title,
-                    description=spec.description,
-                    test_criteria=spec.test_criteria,
-                    parent_id=node.id,
-                    depth=node.depth + 1,
-                    scope_weight=child_weight,
-                    file_path=spec.file_path,
-                    read_files=spec.read_files,
-                    verify_command=spec.verify_command
+    def run_node(self, node_id: str, live: Live, feedback: str = "") -> None:
+        node = self.nodes[node_id]
+        if node.status == "DONE" and not feedback:
+            return  # Already completed (e.g. in a resumed run)
+        if node.children_ids:
+            self.run_manager(node, live, upstream_feedback=feedback)
+        else:
+            self.run_agent(node, live, feedback)
+
+    def run_agent(self, node: TaskNode, live: Live, feedback: str = "") -> None:
+        """Lets the node either do its task itself (worker) or split it (manager)."""
+        problem = ""
+        for attempt in range(1, self.config["max_retries"] + 1):
+            node.status = "REVISING" if (feedback or problem) else "WORKING"
+            live.update(self.render_tree())
+            try:
+                response: AgentResponse = self.call_model(
+                    self.agent_system_prompt(),
+                    self.agent_prompt(node, feedback, problem),
+                    AgentResponse,
+                    node=node,
+                    live=live,
                 )
+                if response.mode == "manager":
+                    if node.depth >= self.config["max_depth"]:
+                        raise ValueError('You are at the maximum depth and must use mode="worker".')
+                    if not response.subtasks:
+                        raise ValueError("Manager mode requires at least one subtask.")
+                    self.spawn_children(node, response, live)
+                    break
+                problem = self.finish_worker(node, response, live)
+                if not problem:
+                    return
+            except Exception as e:
+                problem = f"Your previous attempt was rejected: {e}"
+                self.warn(live, f"Node {node.id} attempt {attempt}: {e}")
+        else:
+            node.status = "FAILED"
+            node.last_feedback = problem
+            self.save_checkpoint()
+            live.update(self.render_tree())
+            return
 
-            # Resolve sibling DAG dependencies
-            for idx, spec in enumerate(subtasks):
-                cid = created_ids[idx]
-                for dep_idx in spec.depends_on:
-                    if 0 <= dep_idx < len(created_ids) and dep_idx != idx:
-                        self.nodes[cid].depends_on.append(created_ids[dep_idx])
+        self.run_manager(node, live)
 
-            node.children_ids = created_ids
+    def finish_worker(self, node: TaskNode, response: AgentResponse, live: Live) -> str:
+        """Writes and verifies a worker's deliverable. Returns the problem to fix, or "" once DONE."""
+        if not response.content.strip():
+            raise ValueError('mode="worker" requires the complete deliverable in `content`.')
 
-        node.status = "PENDING"
+        file_path = node.file_path or response.file_path
+        target = None
+        if file_path:
+            target = resolve_within(self.workspace, file_path)
+            if target is None:
+                raise ValueError(f"file_path {file_path!r} is outside the workspace; use a relative path.")
+        node.file_path = file_path
+        node.verify_command = node.verify_command or response.verify_command
+        node.output = response.content
+        node.summary = response.summary
+
+        if target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(node.output, encoding="utf-8")
+
+        node.verify_status, node.verify_output = "", ""
+        if node.verify_command:
+            node.status = "TESTING"
+            live.update(self.render_tree())
+            passed, output = self.run_verify_command(node.verify_command)
+            node.verify_status = "passed" if passed else "failed"
+            node.verify_output = output
+            if not passed:
+                return f"Verify command `{node.verify_command}` failed:\n{output}"
+
+        node.status = "DONE"
+        node.last_feedback = ""
+        git_commit(self.workspace, f"Complete node {node.id}: {node.title}")
+        self.save_checkpoint()
+        live.update(self.render_tree())
+        return ""
+
+    def spawn_children(self, node: TaskNode, response: AgentResponse, live: Live) -> None:
+        subtasks = response.subtasks[: self.config["max_children"]]
+        child_weight = node.scope_weight / len(subtasks)
+        node.shared_invariants = response.shared_invariants
+        node.output = ""
+        created_ids: List[str] = []
+        for idx, spec in enumerate(subtasks, start=1):
+            cid = f"{node.id}.{idx}"
+            created_ids.append(cid)
+            if spec.file_path and resolve_within(self.workspace, spec.file_path) is None:
+                self.warn(live, f"Node {cid}: dropping file_path {spec.file_path!r} (outside the workspace).")
+                spec.file_path = None
+            self.nodes[cid] = TaskNode(
+                id=cid,
+                title=spec.title,
+                description=spec.description,
+                test_criteria=spec.test_criteria,
+                parent_id=node.id,
+                depth=node.depth + 1,
+                scope_weight=child_weight,
+                file_path=spec.file_path,
+                read_files=spec.read_files,
+                verify_command=spec.verify_command,
+            )
+
+        # Resolve sibling DAG dependencies
+        for idx, spec in enumerate(subtasks):
+            cid = created_ids[idx]
+            for dep_idx in spec.depends_on:
+                if 0 <= dep_idx < len(created_ids) and dep_idx != idx:
+                    self.nodes[cid].depends_on.append(created_ids[dep_idx])
+
+        node.children_ids = created_ids
         self.save_checkpoint()
         live.update(self.render_tree())
 
-        for cid in node.children_ids:
-            self.plan_node(cid, live)
+    def run_children(self, node: TaskNode, live: Live) -> None:
+        """Runs unfinished children, respecting the sibling depends_on DAG."""
+        remaining = [cid for cid in node.children_ids if self.nodes[cid].status != "DONE"]
+        while remaining:
+            progressed = False
+            for cid in list(remaining):
+                child = self.nodes[cid]
+                if all(self.nodes[d].status == "DONE" for d in child.depends_on):
+                    self.run_node(cid, live)
+                    remaining.remove(cid)
+                    progressed = True
+            if not progressed:
+                # Dependencies failed or form a cycle; run the next child anyway
+                self.run_node(remaining.pop(0), live)
 
-    # --- Phase 2: Bottom-Up Execution & Verification ---
+    # --- Reports Flowing Up: the manager judges and aggregates ---
+
+    def child_report(self, child: TaskNode) -> str:
+        if child.verify_status == "passed":
+            verification = f"passed (`{child.verify_command}`)"
+        elif child.verify_status == "failed":
+            verification = f"FAILED (`{child.verify_command}`):\n{child.verify_output[-800:]}"
+        else:
+            verification = "none"
+        lines = [
+            f"--- {child.id}. {child.title} [{child.status}] ---",
+            f"Assigned Scope: {child.description}",
+            f"Test Criteria: {child.test_criteria}",
+            f"Word Count (wc -w): {word_count(child.output)}",
+            f"Delivered To: {f'file {child.file_path}' if child.file_path else 'your aggregated output'}",
+            f"Verification: {verification}",
+            f"Summary: {child.summary or '(none)'}",
+        ]
+        if child.status == "FAILED" and child.last_feedback:
+            lines.append(f"Failure: {child.last_feedback[-800:]}")
+        return "\n".join(lines)
+
+    def manager_review_prompt(self, node: TaskNode, upstream_feedback: str) -> str:
+        sections = [
+            f"Root Goal: {self.root_prompt}",
+            f"Current Task: {node.title}\nDescription: {node.description}\nTest Criteria: {node.test_criteria}",
+        ]
+        if upstream_feedback:
+            sections.append(f"Feedback From Your Own Manager (your branch was sent back):\n{upstream_feedback}")
+        reports = "\n\n".join(self.child_report(self.nodes[cid]) for cid in node.children_ids)
+        sections.append(f"Subordinate Reports (use these exact node_id values for revisions):\n{reports}")
+        sections.append(f"Combined Word Count of Aggregated Content (wc -w): {word_count(self.aggregate(node))}")
+        return "\n\n".join(sections)
+
+    def aggregate(self, node: TaskNode) -> str:
+        """Joins the children's content in order. Children that wrote their own file deliver it there."""
+        parts = [
+            self.nodes[cid].output.strip()
+            for cid in node.children_ids
+            if not self.nodes[cid].file_path and self.nodes[cid].output.strip()
+        ]
+        return "\n\n".join(parts)
+
+    def run_manager(self, node: TaskNode, live: Live, upstream_feedback: str = "") -> None:
+        node.status = "MANAGING"
+        live.update(self.render_tree())
+        self.run_children(node, live)
+
+        rounds = self.config["max_review_rounds"]
+        summary = " ".join(self.nodes[cid].summary for cid in node.children_ids if self.nodes[cid].summary)
+        approved = rounds <= 0
+        critique = ""
+        for round_idx in range(rounds):
+            node.status = "REVIEWING"
+            live.update(self.render_tree())
+            try:
+                review: ManagerReviewResponse = self.call_model(
+                    self.config["prompts"]["manager_review"],
+                    self.manager_review_prompt(node, upstream_feedback),
+                    ManagerReviewResponse,
+                    node=node,
+                    live=live,
+                )
+            except Exception as e:
+                self.warn(live, f"Review failed for node {node.id}; accepting subordinates' work as is. ({e})")
+                approved = True
+                break
+
+            summary = review.summary or summary
+            if review.approved:
+                approved = True
+                break
+
+            critique = "; ".join(f"{r.node_id}: {r.feedback}" for r in review.revisions) or review.reasoning
+            targets = [r for r in review.revisions if r.node_id in node.children_ids]
+            if not targets:
+                self.warn(live, f"Node {node.id} rejected its subordinates' work without actionable revisions.")
+                break
+            if round_idx == rounds - 1:
+                self.warn(live, f"Node {node.id} not approved after {rounds} review round(s).")
+                break
+
+            node.status = "MANAGING"
+            live.update(self.render_tree())
+            for revision in targets:
+                self.run_node(revision.node_id, live, feedback=revision.feedback)
+
+        node.output = self.aggregate(node)
+        node.summary = summary
+        if node.file_path and node.output:
+            target = resolve_within(self.workspace, node.file_path)
+            if target is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(node.output, encoding="utf-8")
+
+        if approved:
+            node.status = "DONE"
+            node.last_feedback = ""
+            git_commit(self.workspace, f"Complete node {node.id}: {node.title}")
+        else:
+            node.status = "FAILED"
+            node.last_feedback = f"Subordinates' work not approved: {critique}"
+        self.save_checkpoint()
+        live.update(self.render_tree())
+
     def run_verify_command(self, command: str) -> tuple[bool, str]:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(self.workspace) + os.pathsep + env.get("PYTHONPATH", "")
@@ -499,170 +762,11 @@ class TaskTreeHarness:
         output = (result.stdout + "\n" + result.stderr).strip()
         return passed, output[-2000:]
 
-    def judge_output(self, node: TaskNode, live: Live) -> tuple[bool, str]:
-        """Isolated judge call seeing only the contract and the artifact."""
-        word_count = len(node.output.split())
-        system_prompt = self.config["prompts"]["judge"]
-
-        user_prompt = (
-            f"Task: {node.title}\n"
-            f"Test Criteria: {node.test_criteria}\n"
-            f"Actual Word Count: {word_count}\n\n"
-            f"Produced Output:\n{node.output}\n\n"
-            f"Assumptions Made: {node.assumptions}"
-        )
-        verdict: JudgeResponse = self.call_model(
-            system_prompt, user_prompt, JudgeResponse, temp=0.0, node=node, live=live
-        )
-        return verdict.passed, verdict.feedback
-
-    def gather_dependency_stubs(self, node: TaskNode) -> str:
-        """Pulls lightweight AST stubs (for code) or summaries (for prose) from completed dependencies."""
-        if not node.depends_on:
-            return "None."
-        blocks = []
-        for dep_id in node.depends_on:
-            dep = self.nodes[dep_id]
-            if dep.file_path and dep.file_path.endswith(".py"):
-                stub = extract_python_stub(self.workspace / dep.file_path)
-                blocks.append(f"--- Interface Stub for {dep.file_path} ({dep.title}) ---\n{stub}")
-            else:
-                blocks.append(f"--- Summary of Dependency '{dep.title}' ---\n{dep.summary}")
-        return "\n\n".join(blocks)
-
-    def execute_node(self, node_id: str, live: Live) -> None:
-        node = self.nodes[node_id]
-        if node.status == "DONE":
-            return  # Already completed in a resumed run
-
-        # First ensure all children are done (respecting sibling depends_on DAG)
-        if node.children_ids:
-            remaining = list(node.children_ids)
-            while remaining:
-                progressed = False
-                for cid in list(remaining):
-                    child = self.nodes[cid]
-                    if all(self.nodes[d].status == "DONE" for d in child.depends_on):
-                        self.execute_node(cid, live)
-                        remaining.remove(cid)
-                        progressed = True
-                if not progressed:
-                    cid = remaining.pop(0)
-                    self.execute_node(cid, live)
-
-        parent_context = "None (this is the root task)."
-        if node.parent_id:
-            p = self.nodes[node.parent_id]
-            parent_context = f"Parent Task: {p.title}\nParent Test Criteria: {p.test_criteria}"
-
-        children_context = ""
-        is_code_integration = False
-        if node.children_ids:
-            parts = []
-            for cid in node.children_ids:
-                c = self.nodes[cid]
-                if c.file_path and c.file_path.endswith(".py"):
-                    is_code_integration = True
-                    stub = extract_python_stub(self.workspace / c.file_path)
-                    parts.append(
-                        f"Child {c.id} ({c.title}) -> {c.file_path}\n"
-                        f"Summary: {c.summary}\nAssumptions: {c.assumptions}\nInterface:\n{stub}"
-                    )
-                else:
-                    parts.append(
-                        f"Child {c.id} ({c.title})\nSummary: {c.summary}\n"
-                        f"Assumptions: {c.assumptions}\nContent:\n{c.output}"
-                    )
-            children_context = "\n\n".join(parts)
-
-        dep_context = self.gather_dependency_stubs(node)
-        read_context = read_context_files(self.context_dir, node.read_files)
-        invariants = self.inherited_invariants(node)
-
-        for attempt in range(1, self.config["max_retries"] + 1):
-            node.status = "DOING" if attempt == 1 else "RETRYING"
-            node.retries = attempt - 1
-            live.update(self.render_tree())
-
-            integration_guidance = (
-                self.config["prompts"]["code_integration"]
-                if is_code_integration or not node.children_ids
-                else self.config["prompts"]["prose_integration"]
-            )
-
-            system_prompt = self.config["prompts"]["executor"].format(
-                integration_guidance=integration_guidance
-            )
-
-            user_prompt = (
-                f"Root Goal (for scale only): {self.root_prompt}\n"
-                f"{parent_context}\n\n"
-                f"Current Task: {node.title}\n"
-                f"Description: {node.description}\n"
-                f"Test Criteria: {node.test_criteria}\n"
-                f"Target File: {node.file_path or 'None (prose/integration)'}\n"
-                f"Verify Command: {node.verify_command or 'None'}\n\n"
-                f"Shared Invariants (from ancestors, must be honored):\n{invariants}\n\n"
-                f"Sibling Dependencies:\n{dep_context}\n\n"
-                f"Reference Files to Inspect:\n{read_context}\n"
-            )
-            if children_context:
-                user_prompt += f"\nImmediate Children to Integrate:\n{children_context}\n"
-            if node.last_feedback:
-                user_prompt += f"\nPrevious Attempt Failed With:\n{node.last_feedback}\nFix this completely."
-
-            try:
-                result: ExecutionResponse = self.call_model(
-                    system_prompt, user_prompt, ExecutionResponse, node=node, live=live
-                )
-                node.output = result.output
-                node.summary = result.summary
-                node.assumptions = result.assumptions
-
-                # Write artifacts to disk if applicable
-                if node.file_path:
-                    target = resolve_within(self.workspace, node.file_path)
-                    if target is None:
-                        raise ValueError(f"file_path {node.file_path!r} is outside the workspace")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(node.output, encoding="utf-8")
-
-                # Verify node
-                node.status = "TESTING"
-                live.update(self.render_tree())
-
-                if node.verify_command:
-                    passed, feedback = self.run_verify_command(node.verify_command)
-                else:
-                    passed, feedback = self.judge_output(node, live)
-            except Exception as e:
-                self.warn(live, f"Node {node.id} attempt {attempt} errored: {e}")
-                passed, feedback = False, f"The previous attempt errored before it could be verified: {e}"
-
-            if passed:
-                node.status = "DONE"
-                node.last_feedback = ""
-                git_commit(self.workspace, f"Complete node {node.id}: {node.title}")
-                self.save_checkpoint()
-                live.update(self.render_tree())
-                return
-            else:
-                node.last_feedback = feedback
-
-        node.status = "FAILED"
-        self.save_checkpoint()
-        live.update(self.render_tree())
-
     def run(self) -> None:
         console = Console()
         try:
             with Live(self.render_tree(), console=console, refresh_per_second=6) as live:
-                if not self.planned:
-                    self.plan_node(self.root_id, live)
-                    self.review_and_revise_plan(live)
-                    self.planned = True
-                    self.save_checkpoint()
-                self.execute_node(self.root_id, live)
+                self.run_node(self.root_id, live)
 
         except KeyboardInterrupt:
             self.save_checkpoint()
@@ -679,93 +783,12 @@ class TaskTreeHarness:
             console.print(f"\n[yellow]{len(failed_nodes)} node(s) failed; rerun them with: tasktree --resume -w {self.workspace}[/yellow]")
 
         root = self.nodes[self.root_id]
+        if root.summary:
+            console.print(f"\n[bold]Summary:[/bold] {root.summary}")
         if self.output_file and root.output:
             out_path = Path(self.output_file)
             out_path.write_text(root.output, encoding="utf-8")
             console.print(f"\n[bold green]Saved final output to {out_path}[/bold green]")
-
-    def serialize_tree_outline(self, node_id: Optional[str] = None, level: int = 0) -> str:
-        nid = node_id or self.root_id
-        node = self.nodes[nid]
-        pad = "  " * level
-        lines = [
-            f"{pad}- {node.id}. {node.title}",
-            f"{pad}  Description: {node.description}",
-            f"{pad}  Test Criteria: {node.test_criteria}",
-        ]
-        if node.shared_invariants:
-            lines.append(f"{pad}  Shared Invariants: {node.shared_invariants}")
-        for cid in node.children_ids:
-            lines.append(self.serialize_tree_outline(cid, level + 1))
-        return "\n".join(lines)
-
-    def prune_subtree(self, node_id: str) -> None:
-        node = self.nodes[node_id]
-        for cid in list(node.children_ids):
-            self.prune_subtree(cid)
-            self.nodes.pop(cid, None)
-        node.children_ids = []
-        node.shared_invariants = ""
-
-    def review_and_revise_plan(self, live: Live) -> None:
-        max_revs = self.config.get("max_plan_revisions", 0)
-        if max_revs <= 0:
-            return
-
-        root = self.nodes[self.root_id]
-        try:
-            self._review_rounds(root, max_revs, live)
-        finally:
-            root.status = "PENDING"
-            live.update(self.render_tree())
-
-    def _review_rounds(self, root: TaskNode, max_revs: int, live: Live) -> None:
-        # One more review than revisions, so the final revision is also checked
-        for round_idx in range(max_revs + 1):
-            root.status = "REVIEWING"
-            live.update(self.render_tree())
-
-            system_prompt = self.config["prompts"]["plan_reviewer"]
-            user_prompt = (
-                f"Root Goal: {self.root_prompt}\n\n"
-                f"Proposed Task Tree:\n{self.serialize_tree_outline()}\n"
-            )
-            try:
-                review: PlanReviewResponse = self.call_model(
-                    system_prompt, user_prompt, PlanReviewResponse
-                )
-            except Exception as e:
-                self.warn(live, f"Plan review failed; executing the current plan. ({e})")
-                return
-
-            if review.approved or not review.flagged_node_ids:
-                return
-
-            if round_idx == max_revs:
-                self.warn(live, f"Plan still not approved after {max_revs} revision(s): {review.critique}")
-                return
-
-            valid_flagged = [nid for nid in review.flagged_node_ids if nid in self.nodes]
-            if not valid_flagged:
-                return
-
-            # Only re-plan the highest flagged ancestors so we don't re-plan nodes already wiped by a parent
-            flagged_set = set(valid_flagged)
-            top_level_flagged = []
-            for nid in valid_flagged:
-                curr = self.nodes[nid].parent_id
-                has_flagged_ancestor = False
-                while curr:
-                    if curr in flagged_set:
-                        has_flagged_ancestor = True
-                        break
-                    curr = self.nodes[curr].parent_id
-                if not has_flagged_ancestor:
-                    top_level_flagged.append(nid)
-
-            for nid in top_level_flagged:
-                self.prune_subtree(nid)
-                self.plan_node(nid, live, revision_feedback=review.critique)
 
 # ---------------------------------------------------------------------------
 # CLI & Config Loading
@@ -788,17 +811,29 @@ def load_config(rc_path: Path) -> Dict[str, Any]:
         "max_depth": parser["harness"].getint("max_depth"),
         "max_children": parser["harness"].getint("max_children"),
         "max_retries": parser["harness"].getint("max_retries"),
+        "max_review_rounds": parser["harness"].getint("max_review_rounds"),
         "workspace": parser["harness"]["workspace"],
-        "max_plan_revisions": parser["harness"].getint("max_plan_revisions"),
         "prompts": {
-            "planner": parser["prompts"]["planner"].strip(),
-            "executor": parser["prompts"]["executor"].strip(),
-            "code_integration": parser["prompts"]["code_integration"].strip(),
-            "prose_integration": parser["prompts"]["prose_integration"].strip(),
-            "judge": parser["prompts"]["judge"].strip(),
-            "plan_reviewer": parser["prompts"]["plan_reviewer"].strip(),
+            "agent": parser["prompts"]["agent"].strip(),
+            "manager_review": parser["prompts"]["manager_review"].strip(),
         },
     }
+
+def find_unknown_rc_keys(rc_path: Path) -> List[str]:
+    """Lists sections and keys in the user's rc that tasktree does not recognize (and so ignores)."""
+    if not rc_path.exists():
+        return []
+    defaults = configparser.ConfigParser(interpolation=None)
+    defaults.read_string(get_default_rc())
+    user = configparser.ConfigParser(interpolation=None)
+    user.read(rc_path)
+    unknown: List[str] = []
+    for section in user.sections():
+        if not defaults.has_section(section):
+            unknown.append(f"[{section}]")
+            continue
+        unknown += [f"[{section}] {key}" for key in user[section] if not defaults.has_option(section, key)]
+    return unknown
 
 def main() -> None:
     argp = argparse.ArgumentParser(description="Recursive local-context task tree harness.")
@@ -822,6 +857,9 @@ def main() -> None:
     if not args.prompt and not args.resume:
         argp.error("the following arguments are required: prompt")
 
+    for key in find_unknown_rc_keys(rc_path):
+        print(f"warning: {rc_path}: unrecognized setting {key} is ignored", file=sys.stderr)
+
     config = load_config(rc_path)
     if args.workspace:
         config["workspace"] = args.workspace
@@ -836,4 +874,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

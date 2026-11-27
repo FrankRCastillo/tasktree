@@ -1,7 +1,6 @@
 import json
 import re
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -23,14 +22,7 @@ class FakeClient:
         system, user = messages[0]["content"], messages[1]["content"]
         match = re.search(r"Current Task: (.*)", user)
         task = match.group(1) if match else None
-        if "task planner" in system:
-            role = "plan"
-        elif "tree architect" in system:
-            role = "review"
-        elif "independent verifier" in system:
-            role = "judge"
-        else:
-            role = "exec"
+        role = "review" if "reviewing the completion reports" in system else "agent"
         self.calls.append((role, task, user))
         return [NS(choices=[NS(delta=NS(content=self.script(role, task, user)))])]
 
@@ -41,36 +33,32 @@ class FakeClient:
         return [t for r, t, _ in self.calls if r == role]
 
 
-def leaf_plan():
-    return json.dumps({"reasoning": "r", "is_leaf": True})
+def worker(content="text", summary="s", **extra):
+    return json.dumps({"reasoning": "r", "mode": "worker", "content": content, "summary": summary, **extra})
 
 
-def exec_ok(output="text"):
-    return json.dumps({"reasoning": "r", "output": output, "summary": "s", "assumptions": []})
+def manager(*subtasks, invariants=""):
+    specs = [{"title": t, "description": f"scope of {t}", "test_criteria": t, **extra} for t, extra in subtasks]
+    return json.dumps({"reasoning": "r", "mode": "manager", "shared_invariants": invariants, "subtasks": specs})
 
 
-def judge_pass():
-    return json.dumps({"reasoning": "r", "passed": True, "feedback": ""})
+def approve(summary="branch done"):
+    return json.dumps({"reasoning": "r", "approved": True, "summary": summary, "revisions": []})
 
 
-def approve():
-    return json.dumps({"approved": True, "critique": "ok", "flagged_node_ids": []})
+def reject(*revisions):
+    return json.dumps({
+        "reasoning": "r", "approved": False, "summary": "not yet",
+        "revisions": [{"node_id": nid, "feedback": fb} for nid, fb in revisions],
+    })
 
 
-def split_plan(*subtasks, invariants=""):
-    specs = [{"title": t, "description": t, "test_criteria": t, **extra} for t, extra in subtasks]
-    return json.dumps({"reasoning": "r", "is_leaf": False, "shared_invariants": invariants, "subtasks": specs})
-
-
-def default_script(root_plan):
+def tree(plans, review=approve):
+    """plans maps a task title to the agent's response; anything unlisted works as a leaf."""
     def script(role, task, user):
-        if role == "plan":
-            return root_plan if task == "Root" else leaf_plan()
         if role == "review":
-            return approve()
-        if role == "judge":
-            return judge_pass()
-        return exec_ok()
+            return review()
+        return plans[task]() if task in plans else worker(content=f"{task} content", summary=f"{task} summary")
     return script
 
 
@@ -86,59 +74,239 @@ def make_harness(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Planning
+# Worker / manager modes and aggregation
 # ---------------------------------------------------------------------------
 
-def test_depends_on_is_zero_based(make_harness):
-    h = make_harness(default_script(split_plan(
-        ("A", {}), ("B", {"depends_on": [0]}), ("C", {"depends_on": [0, 1]}),
-    )))
+def test_root_worker_writes_output(make_harness, tmp_path):
+    h = make_harness(tree({"Root": lambda: worker(content="the essay")}))
+    h.output_file = str(tmp_path / "out.md")
     h.run()
-    assert h.nodes["1.2"].depends_on == ["1.1"]
-    assert h.nodes["1.3"].depends_on == ["1.1", "1.2"]
-    assert h.client.tasks("exec") == ["A", "B", "C", "Root"]
+    assert h.nodes["1"].status == "DONE"
+    assert (tmp_path / "out.md").read_text() == "the essay"
+    assert h.client.tasks("review") == []
 
 
-def test_schema_documents_zero_based_depends_on():
-    assert "0-based" in json.dumps(tt.PlanResponse.model_json_schema())
-
-
-def test_shared_invariants_reach_child_planner_and_executor(make_harness):
-    h = make_harness(default_script(split_plan(("A", {}), invariants="Use British spelling")))
+def test_manager_aggregates_children_in_order_without_rewriting(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}), ("B", {}), ("C", {}))}))
     h.run()
-    assert h.nodes["1"].shared_invariants == "Use British spelling"
-    assert "Use British spelling" in h.client.prompts("plan", "A")[0]
-    assert "Use British spelling" in h.client.prompts("exec", "A")[0]
+    assert h.nodes["1"].output == "A content\n\nB content\n\nC content"
+    assert h.nodes["1"].summary == "branch done"
+    # The root decides once, then only reviews: it never re-emits its children's work
+    assert h.client.tasks("agent") == ["Root", "A", "B", "C"]
+    assert h.client.tasks("review") == ["Root"]
 
 
-def test_planner_failure_makes_node_a_leaf(make_harness):
-    def script(role, task, user):
-        if role == "plan":
-            return "garbage"
-        return judge_pass() if role == "judge" else exec_ok()
-    h = make_harness(script, max_plan_revisions=0)
+def test_children_with_files_deliver_there_not_into_aggregate(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("Intro", {}), ("Code", {"file_path": "app.py"}))}))
+    h.run()
+    assert h.nodes["1"].output == "Intro content"
+    assert (h.workspace / "app.py").read_text() == "Code content"
+
+
+def test_manager_with_file_path_writes_its_aggregate(make_harness):
+    h = make_harness(tree({
+        "Root": lambda: manager(("Report", {"file_path": "report.md"})),
+        "Report": lambda: manager(("S1", {}), ("S2", {})),
+    }))
+    h.run()
+    assert (h.workspace / "report.md").read_text() == "S1 content\n\nS2 content"
+
+
+def test_max_depth_forces_worker(make_harness):
+    responses = iter([manager(("A", {})), worker(content="done anyway")])
+    h = make_harness(tree({"Root": lambda: next(responses)}), max_depth=0)
     h.run()
     assert h.nodes["1"].children_ids == []
+    assert h.nodes["1"].output == "done anyway"
+    first, second = h.client.prompts("agent", "Root")
+    assert 'you MUST choose mode="worker"' in first
+    assert "maximum depth" in second.split("Problem With Your Previous Attempt")[1]
+
+
+def test_reasoning_stream_counts_as_progress_but_not_content(make_harness):
+    h = make_harness(tree({}))
+    node = h.nodes["1"]
+    seen = []
+    h.render_tree = lambda: seen.append(node.live_tokens)
+    stream = [NS(choices=[NS(delta=NS(content=None, reasoning_content="hmm {"))])] * 5
+    stream += [NS(choices=[NS(delta=NS(content=worker(content="final")))])]
+    h.client.chat.completions.create = lambda **kwargs: stream
+    response = h.call_model("sys", "user", tt.AgentResponse, node=node, live=NS(update=lambda *_: None))
+    assert response.content == "final"
+    assert 5 in seen  # the counter advanced while the model was only thinking
+
+
+def test_agent_prompt_placeholder_tolerates_literal_braces(make_harness):
+    h = make_harness(tree({}))
+    h.config["prompts"]["agent"] = 'Up to {max_children} subtasks. Example: {"mode": "worker"}'
+    assert h.agent_system_prompt() == 'Up to 4 subtasks. Example: {"mode": "worker"}'
+
+
+# ---------------------------------------------------------------------------
+# Context flowing down: intent, invariants, peers, the preceding section
+# ---------------------------------------------------------------------------
+
+def test_worker_sees_intent_invariants_and_peers(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}), ("B", {}), invariants="Use British spelling")}))
+    h.run()
+    prompt_b = h.client.prompts("agent", "B")[0]
+    assert "Intent: Root" in prompt_b                       # chain of command
+    assert "Use British spelling" in prompt_b               # shared invariants
+    assert "1.2. B [WORKING]  <-- you" in prompt_b          # knows its own place
+    assert "1.1. A [DONE]" in prompt_b and "Report: A summary" in prompt_b  # finished peer's report
+    assert "scope of A" in prompt_b
+    assert "End of the Preceding Section" in prompt_b and "A content" in prompt_b
+
+
+def test_preceding_section_crosses_branches(make_harness):
+    h = make_harness(tree({
+        "Root": lambda: manager(("Part1", {}), ("Part2", {})),
+        "Part2": lambda: manager(("Part2a", {})),
+    }))
+    h.run()
+    prompt = h.client.prompts("agent", "Part2a")[0]
+    assert "End of the Preceding Section" in prompt
+    assert "Part1 content" in prompt
+    assert "Intent: scope of Part2" in prompt
+
+
+def test_depends_on_is_zero_based_and_shares_code_stubs(make_harness):
+    h = make_harness(tree({
+        "Root": lambda: manager(("Lib", {"file_path": "lib.py"}), ("App", {"depends_on": [0]})),
+        "Lib": lambda: worker(content="def helper(x: int) -> int:\n    return x\n"),
+    }))
+    h.run()
+    assert h.nodes["1.2"].depends_on == ["1.1"]
+    assert "def helper(x: int) -> int: ..." in h.client.prompts("agent", "App")[0]
+    assert "0-based" in json.dumps(tt.AgentResponse.model_json_schema())
+
+
+# ---------------------------------------------------------------------------
+# Reports flowing up: the manager judges and sends revisions
+# ---------------------------------------------------------------------------
+
+def test_review_sees_reports_not_full_text(make_harness):
+    h = make_harness(tree({
+        "Root": lambda: manager(("A", {})),
+        "A": lambda: worker(content="one two three", summary="three words"),
+    }))
+    h.run()
+    review = h.client.prompts("review", "Root")[0]
+    assert "Word Count (wc -w): 3" in review
+    assert "Summary: three words" in review
+    assert "one two three" not in review
+
+
+def test_revision_reruns_only_the_flagged_child_with_feedback(make_harness):
+    reviews = iter([reject(("1.2", "expand B to 500 words")), approve("all good")])
+    h = make_harness(tree({"Root": lambda: manager(("A", {}), ("B", {}))}, review=lambda: next(reviews)))
+    h.run()
+    assert h.client.tasks("agent") == ["Root", "A", "B", "B"]
+    revised = h.client.prompts("agent", "B")[1]
+    assert "expand B to 500 words" in revised
+    assert "Your Previous Submission:\nB content" in revised
+    assert h.nodes["1"].status == "DONE" and h.nodes["1"].summary == "all good"
+
+
+def test_revision_to_a_manager_child_reaches_its_review(make_harness):
+    root_reviews = iter([reject(("1.1", "section too thin")), approve()])
+
+    def script(role, task, user):
+        if role == "review":
+            if task == "Root":
+                return next(root_reviews)
+            if "section too thin" in user:
+                return reject(("1.1.1", "add examples"))
+            return approve()
+        if task == "Root":
+            return manager(("Branch", {}))
+        if task == "Branch":
+            return manager(("Leaf", {}))
+        return worker(content=f"{task} content")
+
+    h = make_harness(script, max_review_rounds=2)
+    h.run()
+    assert "add examples" in h.client.prompts("agent", "Leaf")[1]
     assert h.nodes["1"].status == "DONE"
+
+
+def test_manager_fails_after_review_rounds_exhausted(make_harness, capsys):
+    h = make_harness(
+        tree({"Root": lambda: manager(("A", {}))}, review=lambda: reject(("1.1", "still wrong"))),
+        max_review_rounds=3,
+    )
+    h.run()
+    assert len(h.client.tasks("review")) == 3
+    assert h.client.tasks("agent").count("A") == 3  # first run + 2 revisions
+    assert h.nodes["1"].status == "FAILED"
+    assert "still wrong" in h.nodes["1"].last_feedback
+    assert "Node 1 (Root) failed" in capsys.readouterr().out
+
+
+def test_reviews_disabled_approves_directly(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}), ("B", {}))}), max_review_rounds=0)
+    h.run()
+    assert h.client.tasks("review") == []
+    assert h.nodes["1"].status == "DONE"
+    assert h.nodes["1"].summary == "A summary B summary"
+
+
+# ---------------------------------------------------------------------------
+# Verification and failures
+# ---------------------------------------------------------------------------
+
+def test_failed_verify_is_retried_then_reported(make_harness):
+    h = make_harness(tree({
+        "Root": lambda: manager(("Script", {"file_path": "s.sh", "verify_command": "exit 1"})),
+    }))
+    h.run()
+    script_node = h.nodes["1.1"]
+    assert script_node.status == "FAILED" and script_node.verify_status == "failed"
+    assert "Verify command `exit 1` failed" in h.client.prompts("agent", "Script")[1]
+    assert "Verification: FAILED" in h.client.prompts("review", "Root")[0]
+
+
+def test_bad_model_output_fails_node_without_stopping_run(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}), ("B", {})), "A": lambda: "not json"}))
+    h.run()
+    assert h.nodes["1.1"].status == "FAILED"
+    assert "rejected" in h.nodes["1.1"].last_feedback
+    assert h.nodes["1.2"].status == "DONE"
+    assert "[FAILED]" in h.client.prompts("review", "Root")[0]
+
+
+def test_verify_timeout_is_a_failure_not_a_crash(make_harness, monkeypatch):
+    h = make_harness(tree({}))
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("cmd", 60)
+
+    monkeypatch.setattr(tt.subprocess, "run", timeout)
+    passed, feedback = h.run_verify_command("sleep 999")
+    assert passed is False
+    assert "timed out" in feedback
 
 
 # ---------------------------------------------------------------------------
 # Path containment
 # ---------------------------------------------------------------------------
 
-def test_escaping_file_paths_are_dropped(make_harness, tmp_path):
+def test_escaping_subtask_file_paths_are_dropped(make_harness, tmp_path):
     outside = tmp_path / "abs_evil.txt"
-    h = make_harness(default_script(split_plan(
-        ("A", {"file_path": "../evil.txt"}),
-        ("B", {"file_path": str(outside)}),
-        ("C", {"file_path": "ok/c.py"}),
-    )))
+    h = make_harness(tree({"Root": lambda: manager(
+        ("A", {"file_path": "../evil.txt"}), ("B", {"file_path": str(outside)}),
+    )}))
     h.run()
-    assert h.nodes["1.1"].file_path is None
-    assert h.nodes["1.2"].file_path is None
+    assert h.nodes["1.1"].file_path is None and h.nodes["1.2"].file_path is None
+    assert not (tmp_path / "evil.txt").exists() and not outside.exists()
+
+
+def test_escaping_worker_file_path_is_rejected_and_retried(make_harness, tmp_path):
+    responses = iter([worker(file_path="../evil.txt"), worker(file_path="ok.txt")])
+    h = make_harness(tree({"Root": lambda: next(responses)}))
+    h.run()
     assert not (tmp_path / "evil.txt").exists()
-    assert not outside.exists()
-    assert (h.workspace / "ok/c.py").read_text() == "text"
+    assert (h.workspace / "ok.txt").read_text() == "text"
 
 
 def test_resolve_within_rejects_sibling_prefix(tmp_path):
@@ -162,96 +330,32 @@ def test_read_context_files_skips_paths_outside_context(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Execution failures
-# ---------------------------------------------------------------------------
-
-def test_bad_model_output_fails_node_without_stopping_run(make_harness, capsys):
-    base = default_script(split_plan(("A", {}), ("B", {}), ("C", {})))
-
-    def script(role, task, user):
-        if role == "exec" and task == "B":
-            return "not json"
-        return base(role, task, user)
-
-    h = make_harness(script)
-    h.run()
-    assert h.nodes["1.2"].status == "FAILED"
-    assert "errored" in h.nodes["1.2"].last_feedback
-    assert [h.nodes[i].status for i in ("1.1", "1.3", "1")] == ["DONE"] * 3
-    # Reported even without -o
-    assert "Node 1.2 (B) failed" in capsys.readouterr().out
-
-
-def test_verify_timeout_is_a_failure_not_a_crash(make_harness, monkeypatch):
-    h = make_harness(default_script(leaf_plan()))
-
-    def timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired("cmd", 60)
-
-    monkeypatch.setattr(tt.subprocess, "run", timeout)
-    passed, feedback = h.run_verify_command("sleep 999")
-    assert passed is False
-    assert "timed out" in feedback
-
-
-# ---------------------------------------------------------------------------
-# Plan review
-# ---------------------------------------------------------------------------
-
-def test_final_revision_is_reviewed_and_root_leaves_reviewing(make_harness):
-    base = default_script(split_plan(("A", {}), ("B", {})))
-    reviews = []
-
-    def script(role, task, user):
-        if role == "review":
-            reviews.append(user)
-            return json.dumps({"approved": False, "critique": "fix B", "flagged_node_ids": ["1.2"]})
-        return base(role, task, user)
-
-    h = make_harness(script, max_plan_revisions=1)
-    h.plan_node(h.root_id, live=NS(update=lambda *_: None, console=NS(print=lambda *_: None)))
-    h.review_and_revise_plan(live=NS(update=lambda *_: None, console=NS(print=lambda *_: None)))
-    assert len(reviews) == 2  # one revision, then a review of that revision
-    assert h.client.tasks("plan").count("B") == 2
-    assert h.nodes["1"].status == "PENDING"
-
-
-# ---------------------------------------------------------------------------
 # Checkpoint / resume
 # ---------------------------------------------------------------------------
 
-def test_resume_reruns_only_unfinished_nodes(make_harness):
-    base = default_script(split_plan(("A", {}), ("B", {})))
-
-    def flaky(role, task, user):
-        if role == "exec" and task == "B":
-            return "not json"
-        return base(role, task, user)
-
-    first = make_harness(flaky)
+def test_resume_reruns_unfinished_nodes_and_keeps_manager_decisions(make_harness):
+    plans = {"Root": lambda: manager(("A", {}), ("B", {})), "B": lambda: "not json"}
+    first = make_harness(tree(plans))
     first.run()
     assert first.nodes["1.2"].status == "FAILED"
 
-    resumed = make_harness(base, resume=True, workspace=first.workspace)
+    resumed = make_harness(tree({}), resume=True, workspace=first.workspace)
     assert resumed.root_prompt == "Root"
+    assert resumed.nodes["1"].status == "PENDING"  # its aggregate included B's failure
     resumed.run()
-    assert set(resumed.client.tasks("exec")) == {"B", "Root"}
-    assert not resumed.client.tasks("plan")
-    assert not resumed.client.tasks("review")
+    assert resumed.client.tasks("agent") == ["B"]  # A is kept, Root does not re-split
     assert all(n.status == "DONE" for n in resumed.nodes.values())
+    assert resumed.nodes["1"].output == "A content\n\nB content"
 
 
-def test_resume_replans_if_planning_was_interrupted(make_harness):
-    h = make_harness(default_script(split_plan(("A", {}))))
-    h.nodes["1.9"] = tt.TaskNode(id="1.9", title="stale", description="", test_criteria="", parent_id="1")
-    h.nodes["1"].children_ids = ["1.9"]
-    h.save_checkpoint()  # planned is still False
-
-    resumed = make_harness(default_script(split_plan(("A", {}))), resume=True, workspace=h.workspace)
-    assert list(resumed.nodes) == ["1"]
-    resumed.run()
-    assert "stale" not in [n.title for n in resumed.nodes.values()]
-    assert resumed.client.tasks("plan")[0] == "Root"
+def test_resume_ignores_fields_from_older_checkpoints(make_harness):
+    h = make_harness(tree({}))
+    h.save_checkpoint()
+    data = json.loads(h.checkpoint_path.read_text())
+    data["nodes"]["1"]["assumptions"] = ["from an older version"]
+    h.checkpoint_path.write_text(json.dumps(data))
+    resumed = make_harness(tree({}), resume=True, workspace=h.workspace)
+    assert resumed.nodes["1"].title == "Root"
 
 
 def test_resume_rejects_old_checkpoint_format(make_harness, tmp_path):
@@ -259,9 +363,26 @@ def test_resume_rejects_old_checkpoint_format(make_harness, tmp_path):
     ws.mkdir()
     (ws / ".tasktree_state.json").write_text(json.dumps({"1": {}}))
     with pytest.raises(ValueError, match="predates resume support"):
-        make_harness(default_script(leaf_plan()), resume=True, workspace=ws)
+        make_harness(tree({}), resume=True, workspace=ws)
 
 
 def test_resume_without_checkpoint_errors(make_harness, tmp_path):
     with pytest.raises(FileNotFoundError):
-        make_harness(default_script(leaf_plan()), resume=True, workspace=tmp_path / "empty")
+        make_harness(tree({}), resume=True, workspace=tmp_path / "empty")
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def test_unknown_rc_keys_are_reported(tmp_path):
+    rc = tmp_path / "rc"
+    rc.write_text(
+        "[harness]\nmax_plan_revisions = 2\nmax_review_rounds = 3\n"
+        "[prompts]\nplanner = old\nagent = new\n"
+        "[extras]\nx = 1\n"
+    )
+    assert tt.find_unknown_rc_keys(rc) == ["[harness] max_plan_revisions", "[prompts] planner", "[extras]"]
+    config = tt.load_config(rc)
+    assert config["max_review_rounds"] == 3
+    assert config["prompts"]["agent"] == "new"
