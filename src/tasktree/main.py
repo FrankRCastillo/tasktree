@@ -271,6 +271,11 @@ class TaskTreeHarness:
             node.live_tokens = 0
             if node.status != "DONE":
                 node.status = "PENDING"
+                # Ancestors integrated incomplete work, so they must re-run too
+                curr = node.parent_id
+                while curr:
+                    self.nodes[curr].status = "PENDING"
+                    curr = self.nodes[curr].parent_id
 
     def warn(self, live: Optional[Live], message: str) -> None:
         if live is not None:
