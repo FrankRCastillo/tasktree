@@ -4,6 +4,8 @@ api_key = ollama
 model = qwen2.5:14b
 temperature = 0.2
 max_tokens = 8192
+# false asks thinking models (e.g. Qwen3 via llama.cpp) to skip hidden reasoning: much faster, possibly less careful
+enable_thinking = true
 
 [harness]
 max_depth = 3

@@ -75,6 +75,7 @@ The live tree shows each node's status: `PENDING`, `WORKING`, `REVISING`, `TESTI
 | `model` | `qwen2.5:14b` | Model name to request |
 | `temperature` | `0.2` | |
 | `max_tokens` | `8192` | Per call; a worker's whole deliverable must fit, plus its JSON |
+| `enable_thinking` | `true` | `false` asks thinking models (e.g. Qwen3 on llama.cpp) to skip hidden reasoning via `chat_template_kwargs`: much faster, possibly less careful. `true` sends nothing extra, so the server's default applies |
 
 **`[harness]`**
 

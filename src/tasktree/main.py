@@ -307,6 +307,11 @@ class TaskTreeHarness:
             f"You MUST respond with valid JSON strictly matching this schema:\n{schema_json}"
         )
         temperature = self.config["temperature"] if temp is None else temp
+        # Only sent when disabling, so servers and templates without the option see an unchanged request
+        extra_body = (
+            {} if self.config["enable_thinking"]
+            else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        )
 
         last_err = None
         for _ in range(3):
@@ -323,6 +328,7 @@ class TaskTreeHarness:
                 max_tokens=self.config["max_tokens"],
                 response_format={"type": "json_object"},
                 stream=True,
+                **extra_body,
             )
 
             chunks: List[str] = []
@@ -808,6 +814,7 @@ def load_config(rc_path: Path) -> Dict[str, Any]:
         "model": parser["model"]["model"],
         "temperature": parser["model"].getfloat("temperature"),
         "max_tokens": parser["model"].getint("max_tokens"),
+        "enable_thinking": parser["model"].getboolean("enable_thinking"),
         "max_depth": parser["harness"].getint("max_depth"),
         "max_children": parser["harness"].getint("max_children"),
         "max_retries": parser["harness"].getint("max_retries"),

@@ -16,9 +16,11 @@ class FakeClient:
     def __init__(self, script):
         self.script = script
         self.calls = []  # (role, task title, user prompt)
+        self.request_kwargs = []
         self.chat = NS(completions=NS(create=self.create))
 
     def create(self, messages, **kwargs):
+        self.request_kwargs.append(kwargs)
         system, user = messages[0]["content"], messages[1]["content"]
         match = re.search(r"Current Task: (.*)", user)
         task = match.group(1) if match else None
@@ -134,6 +136,21 @@ def test_reasoning_stream_counts_as_progress_but_not_content(make_harness):
     response = h.call_model("sys", "user", tt.AgentResponse, node=node, live=NS(update=lambda *_: None))
     assert response.content == "final"
     assert 5 in seen  # the counter advanced while the model was only thinking
+
+
+def test_enable_thinking_true_leaves_request_unchanged(make_harness):
+    h = make_harness(tree({}))
+    assert h.config["enable_thinking"] is True  # the default
+    h.run()
+    assert all("extra_body" not in kwargs for kwargs in h.client.request_kwargs)
+
+
+def test_enable_thinking_false_asks_template_to_skip_reasoning(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}))}), enable_thinking=False)
+    h.run()
+    assert len(h.client.request_kwargs) == 3  # agent calls and the review alike
+    for kwargs in h.client.request_kwargs:
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 def test_agent_prompt_placeholder_tolerates_literal_braces(make_harness):
@@ -378,6 +395,7 @@ def test_resume_without_checkpoint_errors(make_harness, tmp_path):
 def test_unknown_rc_keys_are_reported(tmp_path):
     rc = tmp_path / "rc"
     rc.write_text(
+        "[model]\nenable_thinking = false\n"
         "[harness]\nmax_plan_revisions = 2\nmax_review_rounds = 3\n"
         "[prompts]\nplanner = old\nagent = new\n"
         "[extras]\nx = 1\n"
@@ -385,4 +403,5 @@ def test_unknown_rc_keys_are_reported(tmp_path):
     assert tt.find_unknown_rc_keys(rc) == ["[harness] max_plan_revisions", "[prompts] planner", "[extras]"]
     config = tt.load_config(rc)
     assert config["max_review_rounds"] == 3
+    assert config["enable_thinking"] is False
     assert config["prompts"]["agent"] == "new"
