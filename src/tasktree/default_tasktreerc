@@ -6,6 +6,9 @@ temperature = 0.2
 max_tokens = 8192
 # false asks thinking models (e.g. Qwen3 via llama.cpp) to skip hidden reasoning: much faster, possibly less careful
 enable_thinking = true
+# Tokens per request the server can hold (prompt + response). 0 asks a llama.cpp server via /props;
+# set it explicitly for other servers (for Ollama, your num_ctx)
+context_window = 0
 
 [harness]
 max_depth = 3
@@ -13,15 +16,19 @@ max_children = 4
 max_retries = 3
 max_review_rounds = 2
 workspace = ./tasktree_workspace
+# Every model call's prompt, thinking and response, streamed as they arrive; relative to the workspace, empty disables
+log_file = .tasktree.log
 
 [prompts]
 agent =
     You are one node in a recursive, general-purpose task tree. You operate in one of two modes:
     "worker" or "manager".
 
-    First, evaluate the Current Task against your single-pass capacity:
+    First, evaluate the Current Task against your single-pass capacity; your Output Budget states
+    the hard limit on how much this response can hold:
     - Choose mode="worker" if you can complete the entire task cleanly and thoroughly in a single
-      pass (for prose, roughly 1,500 words or less; for code, a single focused file or module).
+      pass (for prose, roughly 1,500 words or less and never more than your Output Budget; for code,
+      a single focused file or module).
       Produce the complete deliverable in `content`, write a concise `summary` of what you produced
       (including key interfaces/exports for code or main points covered for prose), and leave
       `subtasks` empty.
@@ -45,6 +52,8 @@ agent =
     your lane per the Sibling Overview (do not repeat what peers cover), continue naturally from the
     End of the Preceding Section when one is given, and build on your Dependencies exactly as
     reported. If Revision Feedback is provided, revise Your Previous Submission to address it.
+    Word counts in your task are approximate targets (within about 15%): never count words one by
+    one or redraft to hit an exact number, because the harness measures them for you.
     If a subtask writes code or a script, set `file_path` and an optional shell `verify_command`
     (like 'python3 -m py_compile app.py' or 'pytest test_app.py'); leave `verify_command` null for prose.
 

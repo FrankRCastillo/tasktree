@@ -53,8 +53,28 @@ tasktree --resume -w ./todo                 # continue an interrupted or partly 
 | `--rc FILE` | Config file (default `~/.tasktreerc`). |
 | `--init-config` | Write the default config to `--rc`, overwriting it. |
 | `--resume` | Resume the run checkpointed in the workspace. |
+| `--log FILE` | Where to stream model calls (default `.tasktree.log` in the workspace; `--log ''` disables). |
+
+### Following a run
 
 The live tree shows each node's status: `PENDING`, `WORKING`, `REVISING`, `TESTING`, `MANAGING`, `REVIEWING`, `DONE` or `FAILED`. Active calls show a token counter, which also counts a thinking model's hidden reasoning.
+
+To see what the model is actually writing, follow the run log from another terminal:
+
+```sh
+tail -f tasktree_workspace/.tasktree.log
+```
+
+Each call is logged as it streams: a header (node, call type, whether thinking is on, `max_tokens`), the prompt, the thinking, the response, and a footer with why it stopped, about how many tokens it used and how long it took. Warnings and each node's final status are logged too. Resumed runs append to the same log, which is kept out of the workspace's commits.
+
+### Output budgets
+
+Each worker prompt states an **Output Budget**: about how many words of content fit in that one response. It's computed from `max_tokens`, the room the context window has left after the prompt, overhead for the JSON, and (when thinking is on) half the budget held back for reasoning. A task that needs more than its budget must be split.
+
+If a response still hits its token limit, the harness handles it according to what used up the room:
+
+- **The answer itself overflowed:** the task was too big for one pass, so the retry tells the node it must split. At maximum depth, where it can't split, it's told to condense instead.
+- **Thinking used up the room before the answer:** that says nothing about the task's size, so the same call is retried immediately with thinking off.
 
 ### The workspace
 
@@ -76,6 +96,7 @@ The live tree shows each node's status: `PENDING`, `WORKING`, `REVISING`, `TESTI
 | `temperature` | `0.2` | |
 | `max_tokens` | `8192` | Per call; a worker's whole deliverable must fit, plus its JSON |
 | `enable_thinking` | `true` | `false` asks thinking models (e.g. Qwen3 on llama.cpp) to skip hidden reasoning via `chat_template_kwargs`: much faster, possibly less careful. `true` sends nothing extra, so the server's default applies |
+| `context_window` | `0` | Tokens per request the server can hold. `0` asks a llama.cpp server (`/props`); set it for other servers, e.g. Ollama's `num_ctx`. If it's unknown, budgets use `max_tokens` alone |
 
 **`[harness]`**
 
@@ -86,6 +107,7 @@ The live tree shows each node's status: `PENDING`, `WORKING`, `REVISING`, `TESTI
 | `max_retries` | `3` | Attempts per worker (invalid output, bad path, failed verify) |
 | `max_review_rounds` | `2` | Reviews per manager; revisions happen between rounds. `0` approves without review |
 | `workspace` | `./tasktree_workspace` | |
+| `log_file` | `.tasktree.log` | Run log, relative to the workspace; empty disables |
 
 **`[prompts]`**
 

@@ -1,3 +1,4 @@
+import io
 import json
 import re
 import subprocess
@@ -26,7 +27,10 @@ class FakeClient:
         task = match.group(1) if match else None
         role = "review" if "reviewing the completion reports" in system else "agent"
         self.calls.append((role, task, user))
-        return [NS(choices=[NS(delta=NS(content=self.script(role, task, user)))])]
+        out = self.script(role, task, user)
+        if isinstance(out, list):
+            return out  # a prebuilt stream, e.g. from truncated()
+        return [NS(choices=[NS(delta=NS(content=out), finish_reason="stop")])]
 
     def prompts(self, role, task):
         return [u for r, t, u in self.calls if r == role and t == task]
@@ -55,6 +59,13 @@ def reject(*revisions):
     })
 
 
+def truncated(response_tokens=0, thinking_tokens=0):
+    """A stream that hits its token limit, one chunk per token like llama.cpp."""
+    stream = [NS(choices=[NS(delta=NS(content=None, reasoning_content="hmm "), finish_reason=None)])] * thinking_tokens
+    stream += [NS(choices=[NS(delta=NS(content="word "), finish_reason=None)])] * response_tokens
+    return stream + [NS(choices=[NS(delta=NS(content=None), finish_reason="length")])]
+
+
 def tree(plans, review=approve):
     """plans maps a task title to the agent's response; anything unlisted works as a leaf."""
     def script(role, task, user):
@@ -65,7 +76,9 @@ def tree(plans, review=approve):
 
 
 @pytest.fixture
-def make_harness(tmp_path):
+def make_harness(tmp_path, monkeypatch):
+    monkeypatch.setattr(tt, "detect_context_window", lambda base_url: None)  # no network in tests
+
     def make(script, prompt="Root", resume=False, workspace=None, **overrides):
         config = tt.load_config(tmp_path / "missing-rc")
         config.update(workspace=str(workspace or tmp_path / "ws"), max_retries=2, **overrides)
@@ -133,7 +146,7 @@ def test_reasoning_stream_counts_as_progress_but_not_content(make_harness):
     stream = [NS(choices=[NS(delta=NS(content=None, reasoning_content="hmm {"))])] * 5
     stream += [NS(choices=[NS(delta=NS(content=worker(content="final")))])]
     h.client.chat.completions.create = lambda **kwargs: stream
-    response = h.call_model("sys", "user", tt.AgentResponse, node=node, live=NS(update=lambda *_: None))
+    response = h.call_model("sys", "user", tt.AgentResponse, label="agent", node=node, live=NS(update=lambda *_: None))
     assert response.content == "final"
     assert 5 in seen  # the counter advanced while the model was only thinking
 
@@ -386,6 +399,140 @@ def test_resume_rejects_old_checkpoint_format(make_harness, tmp_path):
 def test_resume_without_checkpoint_errors(make_harness, tmp_path):
     with pytest.raises(FileNotFoundError):
         make_harness(tree({}), resume=True, workspace=tmp_path / "empty")
+
+
+# ---------------------------------------------------------------------------
+# Output budget and truncation
+# ---------------------------------------------------------------------------
+
+def budget_words(prompt):
+    return int(re.search(r"Output Budget: .*?about ([\d,]+) words", prompt).group(1).replace(",", ""))
+
+
+def expected_words(tokens, thinking):
+    tokens -= tt.RESPONSE_OVERHEAD_TOKENS
+    if thinking:
+        tokens = int(tokens * (1 - tt.THINKING_RESERVE))
+    return int(tokens * tt.WORDS_PER_TOKEN)
+
+
+def test_output_budget_follows_max_tokens_and_thinking(make_harness):
+    on = make_harness(tree({}), max_tokens=8192)
+    on.run()
+    assert budget_words(on.client.prompts("agent", "Root")[0]) == expected_words(8192, thinking=True)
+
+    off = make_harness(tree({}), max_tokens=8192, enable_thinking=False)
+    off.run()
+    assert budget_words(off.client.prompts("agent", "Root")[0]) == expected_words(8192, thinking=False)
+
+
+def test_output_budget_shrinks_to_fit_context_window(make_harness):
+    h = make_harness(tree({}), max_tokens=32768, context_window=6000)
+    h.run()
+    prompt = h.client.prompts("agent", "Root")[0]
+    assert 0 < budget_words(prompt) < expected_words(6000, thinking=True)
+    assert h.client.request_kwargs[0]["max_tokens"] < 6000
+
+
+def test_truncated_worker_is_told_to_split(make_harness):
+    responses = iter([truncated(response_tokens=40), manager(("A", {}), ("B", {}))])
+    h = make_harness(tree({"Root": lambda: next(responses)}))
+    h.run()
+    retry = h.client.prompts("agent", "Root")[1]
+    assert "cut off after about 30 words" in retry
+    assert 'You MUST choose mode="manager"' in retry
+    assert h.nodes["1"].children_ids == ["1.1", "1.2"]
+    assert h.nodes["1"].status == "DONE"
+
+
+def test_truncated_worker_at_max_depth_is_told_to_condense(make_harness):
+    responses = iter([truncated(response_tokens=40), worker(content="short")])
+    h = make_harness(tree({"Root": lambda: next(responses)}), max_depth=0)
+    h.run()
+    retry = h.client.prompts("agent", "Root")[1]
+    assert "cannot split" in retry and "Cover the essentials" in retry
+    assert h.nodes["1"].output == "short"
+
+
+def test_thinking_overflow_retries_the_call_with_thinking_off(make_harness):
+    responses = iter([truncated(response_tokens=2, thinking_tokens=50), worker(content="answer")])
+    h = make_harness(tree({"Root": lambda: next(responses)}))
+    h.run()
+    first, second = h.client.request_kwargs
+    assert "extra_body" not in first
+    assert second["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    # Same call retried, not a failed attempt: the prompt is unchanged and no split is demanded
+    prompt_1, prompt_2 = h.client.prompts("agent", "Root")
+    assert prompt_1 == prompt_2
+    assert h.nodes["1"].output == "answer"
+    assert "retrying with thinking off" in (h.workspace / ".tasktree.log").read_text()
+
+
+def test_truncated_review_accepts_the_work(make_harness):
+    h = make_harness(tree({"Root": lambda: manager(("A", {}))}, review=lambda: truncated(response_tokens=10)))
+    h.run()
+    assert h.nodes["1"].status == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# Run log
+# ---------------------------------------------------------------------------
+
+def test_log_streams_prompt_thinking_and_response(make_harness):
+    def script(role, task, user):
+        return [
+            NS(choices=[NS(delta=NS(content=None, reasoning_content="Let me "), finish_reason=None)]),
+            NS(choices=[NS(delta=NS(content=None, reasoning_content="think."), finish_reason=None)]),
+            NS(choices=[NS(delta=NS(content=worker(content="the essay")), finish_reason="stop")]),
+        ]
+
+    h = make_harness(script)
+    h.run()
+    log = (h.workspace / ".tasktree.log").read_text()
+    assert "tasktree started: Root" in log
+    assert "node 1 | agent | thinking on" in log
+    assert "--- prompt ---\nRoot Goal: Root" in log
+    assert "--- thinking ---\nLet me think." in log
+    assert "--- response ---\n" in log and "the essay" in log
+    assert "finish: stop | ~2 thinking + ~1 response tokens" in log
+    assert "node 1 DONE: Root" in log
+    # Kept out of the workspace's per-node commits
+    tracked = subprocess.run(["git", "ls-files"], cwd=h.workspace, capture_output=True, text=True).stdout
+    assert ".tasktree.log" not in tracked
+    assert ".tasktree.log" in (h.workspace / ".git/info/exclude").read_text().splitlines()
+
+
+def test_log_can_be_disabled(make_harness):
+    h = make_harness(tree({}), log_file="")
+    h.run()
+    assert not (h.workspace / ".tasktree.log").exists()
+
+
+def test_log_appends_across_resume(make_harness):
+    first = make_harness(tree({"Root": lambda: "not json"}))
+    first.run()
+    resumed = make_harness(tree({}), resume=True, workspace=first.workspace)
+    resumed.run()
+    log = (first.workspace / ".tasktree.log").read_text()
+    assert log.index("tasktree started") < log.index("tasktree resumed")
+
+
+def test_detect_context_window_reads_llama_cpp_props(monkeypatch):
+    requested = []
+
+    def fake_urlopen(url, timeout):
+        requested.append(url)
+        return io.BytesIO(json.dumps({"default_generation_settings": {"n_ctx": 65536}}).encode())
+
+    monkeypatch.setattr(tt.urllib.request, "urlopen", fake_urlopen)
+    assert tt.detect_context_window("http://localhost:8092/v1") == 65536
+    assert requested == ["http://localhost:8092/props"]
+
+    def unreachable(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(tt.urllib.request, "urlopen", unreachable)
+    assert tt.detect_context_window("http://localhost:11434/v1") is None
 
 
 # ---------------------------------------------------------------------------

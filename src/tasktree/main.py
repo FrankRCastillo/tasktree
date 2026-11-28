@@ -20,7 +20,10 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Literal
 
@@ -34,6 +37,13 @@ from rich.text import Text
 
 # How much of the preceding section a worker sees so its content can continue from it
 PRECEDING_TAIL_CHARS = 1500
+
+# Output budget estimates. Deliberately conservative: overshooting the budget costs a whole wasted call.
+CHARS_PER_TOKEN = 3.5          # prompt size estimate for English prose and code
+WORDS_PER_TOKEN = 0.75         # deliverable words per output token
+RESPONSE_OVERHEAD_TOKENS = 800  # JSON keys, the reasoning and summary fields
+THINKING_RESERVE = 0.5         # share of the budget left for hidden reasoning when thinking is on
+MIN_RESPONSE_TOKENS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +209,66 @@ def git_commit(workspace: Path, message: str) -> None:
     subprocess.run(["git", "commit", "-m", message], cwd=workspace, capture_output=True)
 
 
+def timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def schema_text(schema: type[BaseModel]) -> str:
+    return json.dumps(schema.model_json_schema(), indent=2)
+
+
+def detect_context_window(base_url: str) -> Optional[int]:
+    """Asks a llama.cpp server for its per-slot context size. Returns None for servers without /props."""
+    root = base_url.rstrip("/").removesuffix("/v1")
+    try:
+        with urllib.request.urlopen(f"{root}/props", timeout=3) as resp:
+            n_ctx = json.load(resp).get("default_generation_settings", {}).get("n_ctx")
+        return int(n_ctx) if n_ctx else None
+    except Exception:
+        return None
+
+
+class OutputTruncated(Exception):
+    """The response hit its token limit before finishing, so the deliverable is too big for one pass."""
+
+    def __init__(self, response_tokens: int):
+        self.words = int(response_tokens * WORDS_PER_TOKEN)
+        super().__init__(f"response cut off at its token limit after about {self.words} words")
+
+
+class RunLog:
+    """Append-only, human-readable stream of every model call, written as it arrives so it can be followed with tail -f."""
+
+    def __init__(self, path: Optional[Path]):
+        self.path = path
+        self.file = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = open(path, "a", encoding="utf-8")
+        self.current_stream: Optional[str] = None
+
+    def write(self, text: str) -> None:
+        if self.file is not None:
+            self.file.write(text)
+            self.file.flush()
+
+    def line(self, text: str) -> None:
+        self.current_stream = None
+        self.write(f"{text}\n")
+
+    def stream(self, kind: str, text: str) -> None:
+        """Appends streamed text, with a header whenever the stream switches between prompt/thinking/response."""
+        if kind != self.current_stream:
+            self.write(f"\n--- {kind} ---\n")
+            self.current_stream = kind
+        self.write(text)
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
 def extract_json_payload(raw_text: str) -> Dict[str, Any]:
     """Safely extracts JSON even if a local model wraps it in markdown fences."""
     cleaned = raw_text.strip()
@@ -237,6 +307,8 @@ class TaskTreeHarness:
         self.nodes: Dict[str, TaskNode] = {}
         self.root_id = "1"
         self.context_dir = Path(context_dir).resolve() if context_dir else None
+        self.context_window = config["context_window"] or detect_context_window(config["base_url"])
+        self.log = RunLog(None)
 
         if resume:
             self.load_checkpoint()
@@ -254,6 +326,30 @@ class TaskTreeHarness:
             )
 
         init_git_workspace(self.workspace)
+        if config["log_file"]:
+            log_path = Path(config["log_file"])
+            log_path = log_path if log_path.is_absolute() else self.workspace / log_path
+            self.exclude_from_workspace_git(log_path)
+            self.log = RunLog(log_path)
+        self.log.line(
+            f"\n##### [{timestamp()}] tasktree {'resumed' if resume else 'started'}: {self.root_prompt}\n"
+            f"##### model {config['model']} | context window {self.context_window or 'unknown'} "
+            f"| max_tokens {config['max_tokens']} | thinking {'on' if config['enable_thinking'] else 'off'}"
+        )
+
+    def exclude_from_workspace_git(self, path: Path) -> None:
+        """Keeps the log out of the workspace's per-node commits."""
+        try:
+            rel = path.resolve().relative_to(self.workspace)
+        except ValueError:
+            return
+        exclude = self.workspace / ".git" / "info" / "exclude"
+        if not exclude.parent.is_dir():
+            return
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if str(rel) not in existing.splitlines():
+            with open(exclude, "a", encoding="utf-8") as f:
+                f.write(("" if existing.endswith("\n") or not existing else "\n") + f"{rel}\n")
 
     def save_checkpoint(self) -> None:
         data = {
@@ -288,69 +384,64 @@ class TaskTreeHarness:
                     ancestor.status = "PENDING"
 
     def warn(self, live: Optional[Live], message: str) -> None:
+        self.log.line(f"[{timestamp()}] warning: {message}")
         if live is not None:
             live.console.print(f"[yellow]{message}[/yellow]")
+
+    def log_outcome(self, node: TaskNode) -> None:
+        self.log.line(f"[{timestamp()}] node {node.id} {node.status}: {node.title}")
+
+    # --- Output Budget ---
+
+    def output_token_budget(self, prompt_chars: int) -> int:
+        """Tokens the response can use: max_tokens, capped by what the context window has left."""
+        budget = self.config["max_tokens"]
+        if self.context_window:
+            budget = min(budget, self.context_window - int(prompt_chars / CHARS_PER_TOKEN))
+        return max(budget, MIN_RESPONSE_TOKENS)
+
+    def content_word_budget(self, prompt_chars: int) -> int:
+        """Words of deliverable that fit in one response, after JSON overhead and room for thinking."""
+        tokens = self.output_token_budget(prompt_chars) - RESPONSE_OVERHEAD_TOKENS
+        if self.config["enable_thinking"]:
+            tokens = int(tokens * (1 - THINKING_RESERVE))
+        return max(int(tokens * WORDS_PER_TOKEN), 0)
+
+    # --- Model Calls ---
 
     def call_model(
         self,
         system_prompt: str,
         user_prompt: str,
         schema: type[BaseModel],
+        label: str,
         temp: Optional[float] = None,
         node: Optional[TaskNode] = None,
         live: Optional[Live] = None,
     ) -> BaseModel:
-        """Stateless single-turn call with streaming token counter and schema validation."""
-        schema_json = json.dumps(schema.model_json_schema(), indent=2)
+        """Stateless single-turn call with streaming token counter, logging, and schema validation.
+        Raises OutputTruncated if the response itself overflows its budget."""
         full_system = (
             f"{system_prompt}\n\n"
-            f"You MUST respond with valid JSON strictly matching this schema:\n{schema_json}"
+            f"You MUST respond with valid JSON strictly matching this schema:\n{schema_text(schema)}"
         )
         temperature = self.config["temperature"] if temp is None else temp
-        # Only sent when disabling, so servers and templates without the option see an unchanged request
-        extra_body = (
-            {} if self.config["enable_thinking"]
-            else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-        )
+        thinking = self.config["enable_thinking"]
 
         last_err = None
         for _ in range(3):
-            if node is not None:
-                node.live_tokens = 0
-
-            stream = self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=[
-                    {"role": "system", "content": full_system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                max_tokens=self.config["max_tokens"],
-                response_format={"type": "json_object"},
-                stream=True,
-                **extra_body,
+            content, finish_reason, thinking_tokens, response_tokens = self.stream_completion(
+                full_system, user_prompt, temperature, thinking, label, node, live
             )
-
-            chunks: List[str] = []
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
+            if finish_reason == "length":
+                if thinking and thinking_tokens > response_tokens:
+                    # Reasoning used up the budget before the answer: that says nothing about the
+                    # task's size, so let the model answer directly instead
+                    self.warn(live, f"{label} call for node {node.id if node else '?'} ran out of room while "
+                                    f"thinking ({thinking_tokens} tokens); retrying with thinking off.")
+                    thinking = False
                     continue
-                if delta.content:
-                    chunks.append(delta.content)
-                # Thinking models stream hidden reasoning separately; count it so progress stays visible
-                if delta.content or getattr(delta, "reasoning_content", None):
-                    if node is not None:
-                        node.live_tokens += 1
-                        if live is not None and node.live_tokens % 5 == 0:
-                            live.update(self.render_tree())
-
-            content = "".join(chunks)
-            if node is not None:
-                node.live_tokens = 0
-                if live is not None:
-                    live.update(self.render_tree())
-
+                raise OutputTruncated(response_tokens)
             try:
                 parsed = extract_json_payload(content)
                 return schema.model_validate(parsed)
@@ -358,6 +449,81 @@ class TaskTreeHarness:
                 last_err = e
                 user_prompt += f"\n\nYour previous JSON was invalid ({e}). Return ONLY valid JSON matching the schema."
         raise RuntimeError(f"Model failed to return valid structured output: {last_err}")
+
+    def stream_completion(
+        self,
+        full_system: str,
+        user_prompt: str,
+        temperature: float,
+        thinking: bool,
+        label: str,
+        node: Optional[TaskNode],
+        live: Optional[Live],
+    ) -> tuple[str, Optional[str], int, int]:
+        """Streams one completion. Returns (content, finish_reason, thinking tokens, response tokens);
+        token counts are streamed chunks, which servers like llama.cpp send one token at a time."""
+        max_tokens = self.output_token_budget(len(full_system) + len(user_prompt))
+        # Only sent when disabling, so servers and templates without the option see an unchanged request
+        extra_body = {} if thinking else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+
+        node_name = f"node {node.id}" if node else "harness"
+        started = time.monotonic()
+        self.log.line(
+            f"\n===== [{timestamp()}] {node_name} | {label} | thinking {'on' if thinking else 'off'} "
+            f"| max_tokens {max_tokens} ====="
+        )
+        self.log.stream("prompt", user_prompt)
+
+        if node is not None:
+            node.live_tokens = 0
+        stream = self.client.chat.completions.create(
+            model=self.config["model"],
+            messages=[
+                {"role": "system", "content": full_system},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            stream=True,
+            **extra_body,
+        )
+
+        chunks: List[str] = []
+        finish_reason = None
+        thinking_tokens = response_tokens = 0
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            # Thinking models stream hidden reasoning separately; count it so progress stays visible
+            reasoning = getattr(delta, "reasoning_content", None)
+            text = getattr(delta, "content", None)
+            if reasoning:
+                thinking_tokens += 1
+                self.log.stream("thinking", reasoning)
+            if text:
+                response_tokens += 1
+                chunks.append(text)
+                self.log.stream("response", text)
+            if (reasoning or text) and node is not None:
+                node.live_tokens += 1
+                if live is not None and node.live_tokens % 5 == 0:
+                    live.update(self.render_tree())
+
+        if node is not None:
+            node.live_tokens = 0
+            if live is not None:
+                live.update(self.render_tree())
+        self.log.line(
+            f"\n===== end {node_name} | {label} | finish: {finish_reason} | ~{thinking_tokens} thinking + "
+            f"~{response_tokens} response tokens | {time.monotonic() - started:.0f}s ====="
+        )
+        return "".join(chunks), finish_reason, thinking_tokens, response_tokens
 
     # --- Live Indented Number Renderer ---
 
@@ -507,6 +673,15 @@ class TaskTreeHarness:
             sections.append(f"Revision Feedback from your manager (address this directly):\n{feedback}")
         if problem:
             sections.append(f"Problem With Your Previous Attempt (fix this):\n{problem}")
+
+        # The budget depends on how much room the rest of the prompt leaves, so it is measured last
+        prompt_chars = len(self.agent_system_prompt()) + len(schema_text(AgentResponse)) + len("\n\n".join(sections))
+        words = self.content_word_budget(prompt_chars)
+        if node.depth >= max_depth:
+            consequence = "you cannot split, so keep your content within it."
+        else:
+            consequence = 'if the complete deliverable would need more, you cannot do it as a worker: choose mode="manager".'
+        sections.insert(2, f"Output Budget: this response can hold at most about {words:,} words of content; {consequence}")
         return "\n\n".join(sections)
 
     # --- Running Nodes ---
@@ -531,6 +706,7 @@ class TaskTreeHarness:
                     self.agent_system_prompt(),
                     self.agent_prompt(node, feedback, problem),
                     AgentResponse,
+                    label="agent",
                     node=node,
                     live=live,
                 )
@@ -544,6 +720,19 @@ class TaskTreeHarness:
                 problem = self.finish_worker(node, response, live)
                 if not problem:
                     return
+            except OutputTruncated as e:
+                # Overflowing the budget is evidence the task is too big for one pass
+                if node.depth < self.config["max_depth"]:
+                    problem = (
+                        f"Your previous response was cut off after about {e.words:,} words: this task is too "
+                        'large for one pass. You MUST choose mode="manager" and split it into subtasks that each fit.'
+                    )
+                else:
+                    problem = (
+                        f"Your previous response was cut off after about {e.words:,} words, and you are at the "
+                        "maximum depth so you cannot split. Cover the essentials concisely so it fits your Output Budget."
+                    )
+                self.warn(live, f"Node {node.id} attempt {attempt}: {e}")
             except Exception as e:
                 problem = f"Your previous attempt was rejected: {e}"
                 self.warn(live, f"Node {node.id} attempt {attempt}: {e}")
@@ -551,6 +740,7 @@ class TaskTreeHarness:
             node.status = "FAILED"
             node.last_feedback = problem
             self.save_checkpoint()
+            self.log_outcome(node)
             live.update(self.render_tree())
             return
 
@@ -590,6 +780,7 @@ class TaskTreeHarness:
         node.last_feedback = ""
         git_commit(self.workspace, f"Complete node {node.id}: {node.title}")
         self.save_checkpoint()
+        self.log_outcome(node)
         live.update(self.render_tree())
         return ""
 
@@ -704,6 +895,7 @@ class TaskTreeHarness:
                     self.config["prompts"]["manager_review"],
                     self.manager_review_prompt(node, upstream_feedback),
                     ManagerReviewResponse,
+                    label="review",
                     node=node,
                     live=live,
                 )
@@ -747,6 +939,7 @@ class TaskTreeHarness:
             node.status = "FAILED"
             node.last_feedback = f"Subordinates' work not approved: {critique}"
         self.save_checkpoint()
+        self.log_outcome(node)
         live.update(self.render_tree())
 
     def run_verify_command(self, command: str) -> tuple[bool, str]:
@@ -770,17 +963,24 @@ class TaskTreeHarness:
 
     def run(self) -> None:
         console = Console()
+        if self.log.path is not None:
+            console.print(f"[dim]Streaming model calls to {self.log.path}  (follow with: tail -f {self.log.path})[/dim]")
         try:
             with Live(self.render_tree(), console=console, refresh_per_second=6) as live:
                 self.run_node(self.root_id, live)
 
         except KeyboardInterrupt:
             self.save_checkpoint()
+            self.log.line(f"\n##### [{timestamp()}] interrupted")
+            self.log.close()
             console.print(
                 f"\n[yellow]Interrupted. State saved to {self.checkpoint_path}; "
                 f"continue with: tasktree --resume -w {self.workspace}[/yellow]"
             )
             sys.exit(130)
+
+        self.log.line(f"\n##### [{timestamp()}] finished: root {self.nodes[self.root_id].status}")
+        self.log.close()
 
         failed_nodes = [n for n in self.nodes.values() if n.status == "FAILED"]
         for fn in failed_nodes:
@@ -815,11 +1015,13 @@ def load_config(rc_path: Path) -> Dict[str, Any]:
         "temperature": parser["model"].getfloat("temperature"),
         "max_tokens": parser["model"].getint("max_tokens"),
         "enable_thinking": parser["model"].getboolean("enable_thinking"),
+        "context_window": parser["model"].getint("context_window"),
         "max_depth": parser["harness"].getint("max_depth"),
         "max_children": parser["harness"].getint("max_children"),
         "max_retries": parser["harness"].getint("max_retries"),
         "max_review_rounds": parser["harness"].getint("max_review_rounds"),
         "workspace": parser["harness"]["workspace"],
+        "log_file": parser["harness"]["log_file"].strip(),
         "prompts": {
             "agent": parser["prompts"]["agent"].strip(),
             "manager_review": parser["prompts"]["manager_review"].strip(),
@@ -851,6 +1053,7 @@ def main() -> None:
     argp.add_argument("--rc", default=str(Path.home() / ".tasktreerc"), help="Path to .tasktreerc file.")
     argp.add_argument("--init-config", action="store_true", help="Write or overwrite .tasktreerc with default settings and prompts.")
     argp.add_argument("--resume", action="store_true", help="Resume the run checkpointed in the workspace, re-running any node not DONE.")
+    argp.add_argument("--log", help="Where to stream model calls (default: .tasktree.log in the workspace; '' disables).")
     args = argp.parse_args()
 
     rc_path = Path(args.rc)
@@ -870,6 +1073,9 @@ def main() -> None:
     config = load_config(rc_path)
     if args.workspace:
         config["workspace"] = args.workspace
+    if args.log is not None:
+        # Relative to where the command runs, unlike the rc setting, which is relative to the workspace
+        config["log_file"] = str(Path(args.log).resolve()) if args.log else ""
 
     try:
         harness = TaskTreeHarness(
